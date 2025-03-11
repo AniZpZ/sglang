@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
+from sglang.srt.layers.quantization.blockwise_int4 import BlockInt4Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
@@ -37,6 +38,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "tpu_int8": Int8TpuConfig,
     "fp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
+    "blockwise_int4": BlockInt4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "modelopt": ModelOptFp8Config,

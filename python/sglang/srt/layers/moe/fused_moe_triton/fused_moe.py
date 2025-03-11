@@ -97,6 +97,7 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_int8_w4a8: tl.constexpr,
     even_Ks: tl.constexpr,
 ):
     """
@@ -202,6 +203,25 @@ def fused_moe_kernel(
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
+    if use_int8_w4a8:
+        # block-wise
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+        # channel-wise
+        else:
+            # Load per-column scale for weights
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # Load per-token scale for activations
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -246,6 +266,37 @@ def fused_moe_kernel(
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
+        elif use_int8_w4a8:
+            b_packed = tl.load(
+                b_ptrs,
+                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn_packed[None, :] < (N_packed)),
+                other=0
+            )
+            
+            # dequant to int8
+            high_bits = (b_packed >> 4).to(tl.int8)
+            low_bits = (b_packed & 0x0F).to(tl.int8)
+            high_bits = (high_bits << 4) >> 4
+            low_bits = (low_bits << 4) >> 4
+            
+            # set int8 weight matrix
+            n_indices = tl.arange(0, BLOCK_SIZE_N)
+            n_packed = n_indices // 2
+            is_odd = (n_indices % 2).to(tl.int1)
+            b = tl.where(is_odd, 
+                        low_bits[:, n_packed], 
+                        high_bits[:, n_packed])
+
+            if group_k > 0 and group_n > 0:
+                k_start = k * BLOCK_SIZE_K
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                accumulator += tl.dot(a, b).to(tl.float32) * a_scale[:, None] * b_scale[None, :]
+            else:
+                accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -257,7 +308,7 @@ def fused_moe_kernel(
         accumulator = accumulator * moe_weight[:, None]
     if use_int8_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_fp8_w8a8 or use_int8_w8a8:
+    elif use_fp8_w8a8 or use_int8_w8a8 or use_int8_w4a8:
         if group_k > 0 and group_n > 0:
             accumulator = accumulator.to(compute_type)
         else:
@@ -515,6 +566,7 @@ def invoke_fused_moe_kernel(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int8_w4a8: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
 ) -> None:
@@ -554,6 +606,16 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16:
         assert B_scale is not None
+    elif use_int8_w4a8:
+        assert B_scale is not None
+        if block_shape is None:
+            # activation channel-wise int8 quantization
+            A, A_scale = per_token_quant_int8(A)
+        else:
+            # activation block-wise int8 quantization
+            assert len(block_shape) == 2
+            block_n, block_k = block_shape[0], block_shape[1]
+            A, A_scale = per_token_group_quant_int8(A, block_k)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -603,6 +665,7 @@ def invoke_fused_moe_kernel(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w4a8=use_int8_w4a8,
         even_Ks=even_Ks,
         **config,
     )
@@ -756,6 +819,7 @@ def get_config_dtype_str(
     use_int8_w8a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
+    use_int8_w4a8: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "fp8_w8a8"
@@ -763,6 +827,8 @@ def get_config_dtype_str(
         return "int8_w8a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
+    elif use_int8_w4a8:
+        return "int8_w4a8"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
@@ -965,6 +1031,7 @@ def fused_experts_impl(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w4a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -998,6 +1065,7 @@ def fused_experts_impl(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w4a8=use_int8_w4a8,
         dtype=hidden_states.dtype,
     )
 
@@ -1089,6 +1157,7 @@ def fused_experts_impl(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int8_w4a8=use_int8_w4a8,
             block_shape=block_shape,
         )
         if activation == "silu":
@@ -1126,6 +1195,7 @@ def fused_experts_impl(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int8_w4a8=use_int8_w4a8,
             block_shape=block_shape,
         )
 
@@ -1171,6 +1241,7 @@ def fused_moe(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w4a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -1202,6 +1273,8 @@ def fused_moe(
         products for w1 and w2. Defaults to False.
     - use_int8_w8a16 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
+    - use_int8_w4a8 (bool): If True, use int8 arithmetic to compute the inner
+        products for w1 and w2(int4). Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
     - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -1241,6 +1314,7 @@ def fused_moe(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w4a8=use_int8_w4a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,

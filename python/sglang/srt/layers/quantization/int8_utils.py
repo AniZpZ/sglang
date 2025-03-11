@@ -5,6 +5,7 @@ import torch
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8,
     w8a8_block_int8_matmul,
+    w4a8_block_int8_matmul,
 )
 
 
@@ -23,6 +24,29 @@ def apply_w8a8_block_int8_linear(
 
     q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
     output = w8a8_block_int8_matmul(
+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
+    )
+
+    if bias is not None:
+        output = output + bias
+    return output.to(dtype=input.dtype).view(*output_shape)
+
+
+def apply_w4a8_block_int8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert input_scale is None
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
+    output = w4a8_block_int8_matmul(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
     )
 
