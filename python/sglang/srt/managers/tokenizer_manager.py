@@ -123,6 +123,7 @@ class ReqState:
     created_time: float
     finished_time: float = 0.0
     first_token_time: float = 0.0
+    first_scheduled_time: float = 0.0
     last_time: float = 0.0
     last_completion_tokens: int = 1
 
@@ -362,6 +363,7 @@ class TokenizerManager:
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj.priority = request['priority']
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -478,6 +480,7 @@ class TokenizerManager:
     ):
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
+        tokenized_obj.created_time = created_time
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(
@@ -578,6 +581,7 @@ class TokenizerManager:
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
+                tokenized_obj.priority = request['priority']
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 

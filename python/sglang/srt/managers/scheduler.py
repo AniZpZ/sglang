@@ -819,6 +819,8 @@ class Scheduler(
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
+                priority=recv_req.priority,
+                created_time=recv_req.created_time,
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
@@ -960,6 +962,8 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            priority=recv_req.priority,
+            created_time=recv_req.created_time
         )
         req.tokenizer = self.tokenizer
 

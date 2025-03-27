@@ -68,6 +68,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    PRIORITY = "priority"
 
 
 class SchedulePolicy:
@@ -119,6 +120,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_output(waiting_queue)
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            elif policy == CacheAgnosticPolicy.PRIORITY:
+                SchedulePolicy._sort_by_priority(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
@@ -235,6 +238,16 @@ class SchedulePolicy:
     def _sort_by_longest_output(waiting_queue: List[Req]) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens)."""
         waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+
+    @staticmethod
+    def _sort_by_priority(waiting_queue: List[Req]) -> None:
+        """Sorts the waiting queue based on priority"""
+        waiting_queue.sort(
+            key=lambda x:(
+                x.priority,
+                x.created_time
+            )
+        )
 
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:

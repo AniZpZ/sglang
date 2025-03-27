@@ -300,6 +300,11 @@ class TokenizedGenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # User-defined priority of the request.
+    priority: int = 0
+    # created_time
+    created_time: Optional[float] = None
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -396,6 +401,10 @@ class TokenizedEmbeddingReqInput:
     image_inputs: dict
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # User-defined priority of the request.
+    priority: int = 0
+    # created_time
+    created_time: Optional[float] = None
 
 
 @dataclass

@@ -136,6 +136,8 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            priority=req.priority,
+            created_time=req.created_time
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.mm_inputs

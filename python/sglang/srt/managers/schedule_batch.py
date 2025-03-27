@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.managers.schedule_policy import CacheAgnosticPolicy
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -323,6 +325,8 @@ class Req:
         top_logprobs_num: int = 0,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
+        priority: int = 0,
+        created_time: Optional[float] = None,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
@@ -475,6 +479,9 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+        # User-defined priority of the request.
+        self.priority = priority
+        self.created_time = created_time
 
     @property
     def seqlen(self):
@@ -1117,13 +1124,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+            if server_args.schedule_policy == CacheAgnosticPolicy.PRIORITY:
+                sorted_indices.sort(
+                    key=lambda i: (
+                        -self.reqs[i].priority,
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+            else:
+                sorted_indices.sort(
+                    key=lambda i: (
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
 
         def get_required_tokens(num_reqs: int):
             headroom_for_spec_decode = 0
