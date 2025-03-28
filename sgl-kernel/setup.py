@@ -158,7 +158,6 @@ sources = [
     # "csrc/gemm/per_tensor_quant_fp8.cu",
     # "csrc/moe/moe_align_kernel.cu",
     # "csrc/moe/moe_topk_softmax_kernels.cu",
-    # "csrc/moe/marlin_moe_ops.cu",
     "csrc/moe/marlin_moe_wna16/ops.cu",
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu",
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu",

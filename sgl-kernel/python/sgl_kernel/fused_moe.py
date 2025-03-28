@@ -7,7 +7,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.scalar_type import scalar_types
 from vllm.utils import direct_register_custom_op
 
-from moe_w4a8 import jit
 
 def get_scalar_type(num_bits: int, has_zp: bool):
     if has_zp:
@@ -127,20 +126,24 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
     intermediate_cache1 = intermediate_cache1.view(-1, 2 * N)
     intermediate_cache3 = intermediate_cache13[:M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
-    code = jit.generate(None, None, None)
-    # print(code)
+    import os
+    if os.environ.get('JIT_DEBUG') == '1':
+        from moe_w4a8 import jit
+        code = jit.generate(None, None, None)
+        print(code)
 
-    # Build
-    # jit ----
-    # print('Building ...')
-    # args = (('a', torch.Tensor), ('c_or_none', torch.Tensor), ('b_q_weight', torch.Tensor), ('b_scales', torch.Tensor),
-    #         ('b_zeros_or_none', torch.Tensor), ('g_idx_or_none', torch.Tensor), ('perm_or_none', torch.Tensor), 
-    #         ('workspace', torch.Tensor), ('sorted_token_ids', torch.Tensor), ('expert_ids', torch.Tensor), 
-    #         ('num_tokens_past_padded', torch.Tensor), ('topk_weights', torch.Tensor), ('moe_block_size', int), 
-    #         ('top_k', int), ('mul_topk_weights', bool), ('is_ep', bool), ('b_q_type_id', int), ('size_m', int), 
-    #         ('size_n', int), ('size_k', int), ('is_k_full', bool), ('use_atomic_add', bool), ('use_fp32_reduce', bool), 
-    #         ('is_zp_float', bool), ('out', torch.Tensor))
-    # func = jit.build('test_func', args, code)
+        # Build
+        # jit ----
+        print('Building ...')
+        args = (('a', torch.Tensor), ('c_or_none', torch.Tensor), ('b_q_weight', torch.Tensor), ('b_scales', torch.Tensor),
+                ('b_zeros_or_none', torch.Tensor), ('g_idx_or_none', torch.Tensor), ('perm_or_none', torch.Tensor), 
+                ('workspace', torch.Tensor), ('sorted_token_ids', torch.Tensor), ('expert_ids', torch.Tensor), 
+                ('num_tokens_past_padded', torch.Tensor), ('topk_weights', torch.Tensor), ('moe_block_size', int), 
+                ('top_k', int), ('mul_topk_weights', bool), ('is_ep', bool), ('b_q_type_id', int), ('size_m', int), 
+                ('size_n', int), ('size_k', int), ('is_k_full', bool), ('use_atomic_add', bool), ('use_fp32_reduce', bool), 
+                ('is_zp_float', bool), ('out', torch.Tensor))
+        func = jit.build('test_func', args, code)
+        func(hidden_states, intermediate_cache1, w1, w1_scale, w1_zeros, g_idx1, sort_indices1, workspace, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, block_size_m, topk, False, expert_map is not None, scalar_type1.id, M, 2 * N, K, True, True, True, False, intermediate_cache1)
     # jit -----
     intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm(
         hidden_states,

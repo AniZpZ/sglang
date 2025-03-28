@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <Python.h>
 #include <torch/extension.h>
-#include "scalar_type.hpp"
+#include "core/scalar_type.hpp"
 #include <vector>
 
 #define _CONCAT(A, B) A##B
