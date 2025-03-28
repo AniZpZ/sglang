@@ -195,13 +195,12 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _w4a8_int8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed, quant_type):
+    def _w4a8_int8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed, num_bits):
         torch.manual_seed(seed)
         # Initialize int8 quantization parameters
         factor_for_scale = 1e-2
         int8_max = 127
         int8_min = -128
-        quant_type = scalar_types.uint4b8
         # Input tensor
         # M * K
         a = torch.randn((M, K), dtype=dtype) / 10
@@ -218,7 +217,7 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
-            marlin_out, ref_out = marlin_fused_moe(N=N, E=E, K=K, a=a, w1=w1_fp16, w2=w2_fp16, quant_type=quant_type, group_size=-1, act_order=False, score=score, topk=topk, )
+            marlin_out, ref_out = marlin_fused_moe(N=N, E=E, K=K, a=a, w1=w1_fp16, w2=w2_fp16, num_bits=num_bits, group_size=-1, act_order=False, score=score, topk=topk, )
             # ref_out = torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk)
         # Check results
         self.assertTrue(

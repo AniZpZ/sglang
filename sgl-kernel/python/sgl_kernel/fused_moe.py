@@ -131,16 +131,18 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
     # print(code)
 
     # Build
-    print('Building ...')
-    args = (('a', torch.Tensor), ('c_or_none', torch.Tensor), ('b_q_weight', torch.Tensor), ('b_scales', torch.Tensor),
-            ('b_zeros_or_none', torch.Tensor), ('g_idx_or_none', torch.Tensor), ('perm_or_none', torch.Tensor), 
-            ('workspace', torch.Tensor), ('sorted_token_ids', torch.Tensor), ('expert_ids', torch.Tensor), 
-            ('num_tokens_past_padded', torch.Tensor), ('topk_weights', torch.Tensor), ('moe_block_size', int), 
-            ('top_k', int), ('mul_topk_weights', bool), ('is_ep', bool), ('b_q_type_id', int), ('size_m', int), 
-            ('size_n', int), ('size_k', int), ('is_k_full', bool), ('use_atomic_add', bool), ('use_fp32_reduce', bool), 
-            ('is_zp_float', bool), ('out', torch.Tensor))
-    func = jit.build('test_func', args, code)
-    func(
+    # jit ----
+    # print('Building ...')
+    # args = (('a', torch.Tensor), ('c_or_none', torch.Tensor), ('b_q_weight', torch.Tensor), ('b_scales', torch.Tensor),
+    #         ('b_zeros_or_none', torch.Tensor), ('g_idx_or_none', torch.Tensor), ('perm_or_none', torch.Tensor), 
+    #         ('workspace', torch.Tensor), ('sorted_token_ids', torch.Tensor), ('expert_ids', torch.Tensor), 
+    #         ('num_tokens_past_padded', torch.Tensor), ('topk_weights', torch.Tensor), ('moe_block_size', int), 
+    #         ('top_k', int), ('mul_topk_weights', bool), ('is_ep', bool), ('b_q_type_id', int), ('size_m', int), 
+    #         ('size_n', int), ('size_k', int), ('is_k_full', bool), ('use_atomic_add', bool), ('use_fp32_reduce', bool), 
+    #         ('is_zp_float', bool), ('out', torch.Tensor))
+    # func = jit.build('test_func', args, code)
+    # jit -----
+    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
         w1,
@@ -164,8 +166,7 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
         is_k_full,            # is_k_full (注意这里原来是 is_full_k)
         True,                 # use_atomic_add
         True,                 # use_fp32_reduce
-        False,                 # is_zp_float
-        intermediate_cache1
+        False                 # is_zp_float
     )
 
     torch.ops._C.silu_and_mul(intermediate_cache2,
