@@ -135,42 +135,53 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
         # Build
         # jit ----
         print('Building ...')
+        print(intermediate_cache1)
+        # assert K % num_groups == 0, f"size_k = {K}, is not divisible by num_groups = {num_groups}"
+        assert intermediate_cache1.size(0) == M * topk, f"size_m = {intermediate_cache1.size(0)}, is not divisible by M * topk = {M * topk}"
+        assert intermediate_cache1.size(1) == 2 * N, f"size_n = {intermediate_cache1.size(1)}, is not divisible by 2 * N = {2 * N}"
         args = (('a', torch.Tensor), ('c_or_none', torch.Tensor), ('b_q_weight', torch.Tensor), ('b_scales', torch.Tensor),
                 ('b_zeros_or_none', torch.Tensor), ('g_idx_or_none', torch.Tensor), ('perm_or_none', torch.Tensor), 
                 ('workspace', torch.Tensor), ('sorted_token_ids', torch.Tensor), ('expert_ids', torch.Tensor), 
                 ('num_tokens_past_padded', torch.Tensor), ('topk_weights', torch.Tensor), ('moe_block_size', int), 
                 ('top_k', int), ('mul_topk_weights', bool), ('is_ep', bool), ('b_q_type_id', int), ('size_m', int), 
                 ('size_n', int), ('size_k', int), ('is_k_full', bool), ('use_atomic_add', bool), ('use_fp32_reduce', bool), 
-                ('is_zp_float', bool), ('out', torch.Tensor))
+                ('is_zp_float', bool), ('out', torch.Tensor), ("num_groups", int), ("group_size", int), ("is_bf16", bool), ("is_half", bool), ("sorted_token_ids_size_0", int))
         func = jit.build('test_func', args, code)
-        func(hidden_states, intermediate_cache1, w1, w1_scale, w1_zeros, g_idx1, sort_indices1, workspace, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, block_size_m, topk, False, expert_map is not None, scalar_type1.id, M, 2 * N, K, True, True, True, False, intermediate_cache1)
+        print("Running ...")
+        num_groups = w1_scale.size(1)
+        group_size = K / num_groups
+        print(intermediate_cache1.data_ptr())
+        func(hidden_states, intermediate_cache1, w1, w1_scale, w1_zeros, g_idx1, sort_indices1, workspace, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, block_size_m, topk, False, expert_map is not None, scalar_type1.id, M, 2 * N, K, True, True, True, False, intermediate_cache1, num_groups, group_size, True, False, sorted_token_ids.size(0))
+        torch.cuda.synchronize()
+        print(intermediate_cache1)
+    else:
     # jit -----
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm(
-        hidden_states,
-        intermediate_cache1,
-        w1,
-        w1_scale,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        block_size_m,         # moe_block_size
-        topk,                 # top_k
-        False,                # mul_topk_weights
-        expert_map is not None,  # is_ep
-        scalar_type1.id,      # b_q_type_id
-        M,                    # size_m
-        2 * N,                # size_n
-        K,                    # size_k
-        is_k_full,            # is_k_full (注意这里原来是 is_full_k)
-        True,                 # use_atomic_add
-        True,                 # use_fp32_reduce
-        False                 # is_zp_float
-    )
+        intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm(
+            hidden_states,
+            intermediate_cache1,
+            w1,
+            w1_scale,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            block_size_m,         # moe_block_size
+            topk,                 # top_k
+            False,                # mul_topk_weights
+            expert_map is not None,  # is_ep
+            scalar_type1.id,      # b_q_type_id
+            M,                    # size_m
+            2 * N,                # size_n
+            K,                    # size_k
+            is_k_full,            # is_k_full (注意这里原来是 is_full_k)
+            True,                 # use_atomic_add
+            True,                 # use_fp32_reduce
+            False                 # is_zp_float
+        )
 
     torch.ops._C.silu_and_mul(intermediate_cache2,
                               intermediate_cache1.view(-1, 2 * N))
