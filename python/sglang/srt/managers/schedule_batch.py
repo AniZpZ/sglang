@@ -353,6 +353,7 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        commit: Optional[bool] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -498,6 +499,12 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+
+        # for multimodal streaming input
+        self.commit = commit
+        self.last_add_time = None
+        self.multimodal_stream_inputs: Optional[List[MultimodalInputs]] = None
+        self.has_computed_package_size = 0
 
     @property
     def seqlen(self):

@@ -300,6 +300,11 @@ class TokenizedGenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # streaming input
+    streaming_input: bool = False
+    # Whether it is the last package
+    commit: bool = False
+
 
 @dataclass
 class EmbeddingReqInput:

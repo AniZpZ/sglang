@@ -332,6 +332,9 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        if server_args.enable_multimodal_streaming_input:
+            self.streaming_input_prefill_batch = []
+
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
@@ -849,11 +852,22 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
-            req.extend_image_inputs(image_inputs)
+            if recv_req.streaming_input:
+                req.origin_input_ids[-len(recv_req.input_ids):] = self.pad_input_ids_func(
+                    req.origin_input_ids[-len(recv_req.input_ids):], image_inputs
+                )
+                if req.multimodal_stream_inputs is None:
+                    req.multimodal_stream_inputs = [image_inputs]
+                else:
+                    req.multimodal_stream_inputs.append(image_inputs)
+            else:
+
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+                # Expand a single image token into multiple dummy tokens for receiving image embeddings
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
+                req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 error_msg = (
@@ -1159,6 +1173,23 @@ class Scheduler(
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
 
+            if self.server_args.enable_multimodal_streaming_input and len(
+                self.streaming_input_prefill_batch) > 0:
+                new_streaming_input_prefill_batch = []
+                for streaming_input_req in self.streaming_input_prefill_batch:
+                    if streaming_input_req.check_finished():
+                        continue
+                    if not streaming_input_req.commit or streaming_input_req.has_computed_package_size < len(
+                        streaming_input_req.multimodal_stream_inputs):
+                        self.last_batch.filter_batch(chunked_req_to_exclude=streaming_input_req)
+                        self.tree_cache.cache_unfinished_req(streaming_input_req)
+                        # chunked request keeps its rid but will get a new req_pool_idx
+                        self.req_to_token_pool.free(streaming_input_req.req_pool_idx)
+                        self.running_batch.batch_is_full = False
+                        new_streaming_input_prefill_batch.append(streaming_input_req)
+
+                self.streaming_input_prefill_batch = new_streaming_input_prefill_batch
+
             # Filter batch
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch()
@@ -1199,7 +1230,8 @@ class Scheduler(
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and self.chunked_req is None and (self.server_args.
+            enable_multimodal_streaming_input and len(self.streaming_input_prefill_batch) ==0):
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1230,6 +1262,13 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        if self.streaming_input_prefill_batch is not None:
+            for streaming_input_req in self.streaming_input_prefill_batch:
+                streaming_input_req.init_next_round_input()
+                adder.add_chunked_req(streaming_input_req)
+                streaming_input_req.has_computed_package_size = len(
+                    streaming_input_req.multimodal_stream_inputs)
+
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
@@ -1259,6 +1298,11 @@ class Scheduler(
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
+
+            if self.server_args.enable_multimodal_streaming_input:
+                if res.multimodal_stream_inputs:
+                    self.streaming_input_prefill_batch.append(res)
+
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:

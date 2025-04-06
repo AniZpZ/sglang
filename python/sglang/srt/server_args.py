@@ -193,6 +193,8 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
 
+    enable_multimodal_streaming_input: bool = False
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -514,6 +516,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.context_length,
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+        )
+        parser.add_argument(
+            "--enable-multimodal-streaming-input",
+            type=int,
+            default=ServerArgs.enable_multimodal_streaming_input,
+            help="multimodal streaming input, for rtc video call with multimodal  model",
         )
         parser.add_argument(
             "--device",

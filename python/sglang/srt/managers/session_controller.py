@@ -11,6 +11,7 @@
 # ==============================================================================
 
 import logging
+import time
 import uuid
 from typing import Dict, Optional
 
@@ -65,7 +66,55 @@ class Session:
         self.capacity_of_str_len = capacity_of_str_len
         self.req_nodes: Dict[str, SessionReqNode] = {}
 
+    def create_streaming_input_req(self, req_input: TokenizedGenerateReqInput, tokenizer):
+        assert req_input.session_params is not None
+        session_params = req_input.session_params
+        req_node = self.req_nodes[session_params.rid]
+
+
+        if req_node is None:
+            input_ids = req_input.input_ids
+            input_ids_unpadded = req_input.input_ids
+            new_req = Req(
+                rid=req_input.rid,
+                origin_input_text=None,
+                origin_input_ids=input_ids,
+                origin_input_ids_unpadded=input_ids_unpadded,
+                sampling_params=req_input.sampling_params,
+                lora_path=req_input.lora_path,
+                session_id=self.session_id,
+                custom_logit_processor=req_input.custom_logit_processor,
+                stream=req_input.stream,
+                return_logprob=req_input.return_logprob,
+                top_logprobs_num=req_input.top_logprobs_num,
+                token_ids_logprob=req_input.token_ids_logprob,
+            )
+            new_req_node = SessionReqNode(new_req, None)
+            self.req_nodes[req_input.rid] = new_req_node
+
+            last_req = new_req
+
+        else:
+            assert req_node.parent is None
+            last_req = req_node.req
+            assert last_req.output_ids is None
+
+            input_ids = last_req.origin_input_ids
+            input_ids += req_input.input_ids
+
+            input_ids_unpadded = last_req.origin_input_ids_unpadded
+            input_ids_unpadded += req_input.input_ids
+
+            last_req.origin_input_ids = input_ids
+            last_req.origin_input_ids_unpadded = input_ids_unpadded
+
+        last_req.last_add_time = time.time()
+        last_req.commit = req_input.commit
+        return last_req
+
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
+        if req.streaming_input:
+            return self.create_streaming_input_req(req, tokenizer)
         assert req.session_params is not None
         session_params = req.session_params
 

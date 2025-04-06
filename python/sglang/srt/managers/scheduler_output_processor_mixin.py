@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -25,7 +26,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
+        skip_stream_req_list = []
 
         if self.is_generation:
             (
@@ -117,13 +118,20 @@ class SchedulerOutputProcessorMixin:
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
+                elif not req.commit or req.has_computed_package_size < len(req.multimodal_stream_inputs):
+                    if time.time() - req.last_add_time > 30:
+                        req.to_abort = True
+                        req.to_abort_message = "streaming input timeout"
+                        req.check_finished()
+                    else:
+                        skip_stream_req_list.append(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    skip_stream_req_list.append(req)
 
                     # Incrementally update input logprobs.
                     if req.return_logprob:
@@ -172,7 +180,7 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req_list)
 
     def process_batch_result_decode(
         self,
@@ -436,16 +444,16 @@ class SchedulerOutputProcessorMixin:
         return num_input_logprobs
 
     def stream_output(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self, reqs: List[Req], return_logprob: bool, skip_req_list: Optional[List[Req]] = None
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            self.stream_output_generation(reqs, return_logprob, skip_req_list)
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
     def stream_output_generation(
-        self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
+        self, reqs: List[Req], return_logprob: bool, skip_req_list: Optional[List[Req]] = None
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -489,7 +497,7 @@ class SchedulerOutputProcessorMixin:
             ) = None
 
         for req in reqs:
-            if req is skip_req:
+            if req in skip_req_list:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.

@@ -1304,6 +1304,17 @@ def v1_chat_generate_response(
         )
         return response
 
+async def v1_chat_completions_streaming(
+    tokenizer_manager, raw_request: Request, cache_report=False
+):
+    request_json = await raw_request.json()
+    all_requests = [ChatCompletionRequest(**request_json)]
+    created = int(time.time())
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    tokenizer_manager.generate_request(
+        adapted_request, raw_request
+    )
+
 
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
