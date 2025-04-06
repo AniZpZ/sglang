@@ -895,6 +895,7 @@ def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
     tokenizer_manager,
     request_ids: List[str] = None,
+    first_package=True
 ):
     input_ids = []
     prompts = []
@@ -989,7 +990,10 @@ def v1_chat_generate_request(
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
-                prompt = conv.get_prompt()
+                if first_package:
+                    prompt = conv.get_prompt()
+                else:
+                    prompt = conv.get_unit_prompt()
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
@@ -1305,7 +1309,7 @@ def v1_chat_generate_response(
         return response
 
 async def v1_chat_completions_streaming(
-    tokenizer_manager, raw_request: Request, cache_report=False
+    tokenizer_manager, raw_request: Request, cache_report=False, first_package=False
 ):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]

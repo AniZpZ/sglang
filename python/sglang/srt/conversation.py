@@ -81,6 +81,13 @@ class Conversation:
 
     audio_data: Optional[List[str]] = None
 
+    def get_unit_prompt(self) -> str:
+        prompt = ""
+        for item in self.messages:
+            assert "user" in  item[0]
+            prompt += item[1]
+        return prompt
+
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
         system_prompt = self.system_template.format(system_message=self.system_message)
@@ -450,6 +457,65 @@ def generate_embedding_convs(
 
     return convs
 
+def generate_unit_chat_conv(
+    request: ChatCompletionRequest, template_name: str
+) -> Conversation:
+    conv = chat_templates[template_name].copy()
+    conv = Conversation(
+        name=conv.name,
+        system_template=conv.system_template,
+        system_message=conv.system_message,
+        roles=conv.roles,
+        messages=list(conv.messages),  # prevent in-place modification
+        offset=conv.offset,
+        sep_style=SeparatorStyle(conv.sep_style),
+        sep=conv.sep,
+        sep2=conv.sep2,
+        stop_str=conv.stop_str,
+        image_data=[],
+        audio_data=[],
+        modalities=[],
+        image_token=conv.image_token,
+        audio_token=conv.audio_token,
+    )
+    for message in request.messages:
+        msg_role = message.role
+        assert msg_role == "user"
+        # Handle the various types of Chat Request content types here.
+        if isinstance(message.content, str):
+            conv.append_message(conv.roles[0], message.content)
+        else:
+            real_content = ""
+            # calculate number of image_url
+            num_image_url = 0
+            for content in message.content:
+                if content.type == "image_url":
+                    num_image_url += 1
+                    conv.modalities.append(content.modalities)
+            if num_image_url > 1:
+                image_token = conv.image_token
+            else:
+                image_token = (
+                    conv.image_token + "\n"
+                    if conv.name != "qwen2-vl"
+                    else conv.image_token
+                )
+            audio_token = conv.audio_token
+            for content in message.content:
+                if content.type == "text":
+                    if num_image_url > 16:
+                        real_content += "\n"  # for video
+                    real_content += content.text
+                elif content.type == "image_url":
+                    # NOTE: Only works for llava
+                    real_content += image_token
+                    conv.append_image(content.image_url.url)
+                elif content.type == "audio_url":
+                    real_content += audio_token
+                    conv.append_audio(content.audio_url.url)
+
+            conv.append_message(conv.roles[0], real_content)
+    return conv
 
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
