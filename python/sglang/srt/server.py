@@ -16,3 +16,5 @@
 # They will be removed in new versions.
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.http_server import kill_process_tree, launch_server
+from sglang.srt.entrypoints.web_socket_server import launch_realtime_server
+

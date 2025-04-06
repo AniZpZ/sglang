@@ -1458,6 +1458,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         global bid
         bid += 1
+
+        multimodal_inputs = []
+        for r in self.reqs:
+            if r.multimodal_inputs is not None:
+                multimodal_inputs.append(r.multimodal_inputs)
+            if r.multimodal_stream_inputs is not None:
+                multimodal_inputs.extend(r.multimodal_stream_inputs)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1477,7 +1485,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            multimodal_inputs=[r.multimodal_inputs for r in self.reqs],
+            multimodal_inputs=multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,

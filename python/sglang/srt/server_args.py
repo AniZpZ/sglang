@@ -519,8 +519,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-multimodal-streaming-input",
-            type=int,
-            default=ServerArgs.enable_multimodal_streaming_input,
+            action="store_true",
             help="multimodal streaming input, for rtc video call with multimodal  model",
         )
         parser.add_argument(

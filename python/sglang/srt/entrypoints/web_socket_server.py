@@ -51,7 +51,7 @@ async def streaming_input_handler(websocket):
 
 
 
-def realtime_launch_server(
+def launch_realtime_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
     launch_callback: Optional[Callable[[], None]] = None,
