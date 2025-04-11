@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
+from sgl_kernel import fused_marlin_moe, fused_marlin_w4a8_moe
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import (
@@ -53,6 +54,7 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
+    "CompressedTensorsW4A8MoEMethod",
 ]
 
 
@@ -79,6 +81,8 @@ class CompressedTensorsMoEMethod:
                     "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm"
                 )
             return CompressedTensorsWNA16MoEMethod(quant_config)
+        elif quant_config._is_w4a8_group_channel(weight_quant, input_quant):
+            return CompressedTensorsW4A8MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
         else:
@@ -666,7 +670,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             correction_bias=correction_bias,
         )
 
-        return torch.ops.vllm.fused_marlin_moe(
+        return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
@@ -680,5 +684,396 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
             num_bits=self.num_bits,
+            is_k_full=self.is_k_full,
+        )
+
+
+class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
+    def __init__(
+        self, quant_config: "CompressedTensorsConfig"
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoEMethodBase,
+            FusedMoeWeightScaleSupported,
+        )
+
+        self.quant_config = quant_config
+        # TODO: @dsikka: refactor this to use schemes as other kernels
+        # are supported + check if the layer is being ignored.
+        weight_config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        input_config = self.quant_config.target_scheme_map["Linear"].get("input_activations")
+        self.num_bits = weight_config.num_bits
+        self.packed_factor = 32 // weight_config.num_bits
+        self.strategy = weight_config.strategy
+        self.group_size = weight_config.group_size
+
+        assert weight_config.symmetric, "Only symmetric quantization is supported for W4A8 for now"
+        assert self.num_bits == 4, "Only 4 bit weight is supported for W4A8"
+        self.act_num_bits = input_config.num_bits
+        assert self.act_num_bits == 8, "Only 8 bit activations are supported for W4A8"
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        assert (
+            params_dtype == torch.float16
+        ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
+
+        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+
+        # Will transpose the loaded weight along the
+        # intermediate and hidden dim sizes. Will
+        # shard for TP along the transposed dims
+        extra_weight_attrs.update(
+            {"is_transposed": True, "quant_method": self.strategy}
+        )
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.packed_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_packed", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // self.packed_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_packed", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # In the case where we have actorder/g_idx,
+        # we do not partition the w2 scales
+        # load_full_w2 = self.actorder and self.group_size != -1
+        # w2_scales_size = (
+        #     intermediate_size_full if load_full_w2 else intermediate_size_per_partition
+        # )
+
+        self.is_k_full = (
+            intermediate_size_per_partition == intermediate_size_full
+        )
+
+        # register scales
+        if self.strategy == "channel":
+            num_groups_w2 = num_groups_w13 = 1
+            self.group_size = -1
+        else:
+            num_groups_w2 = intermediate_size_per_partition // self.group_size
+            num_groups_w13 = hidden_size // self.group_size
+
+        w13_scale_channel = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                1,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scale_channel_", w13_scale_channel)
+        set_weight_attrs(w13_scale_channel, extra_weight_attrs)
+
+        w2_scale_channel = torch.nn.Parameter(
+            torch.ones(num_experts, 1, hidden_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scale_channel_", w2_scale_channel)
+        set_weight_attrs(w2_scale_channel, extra_weight_attrs)
+        # set_weight_attrs(w2_scale_channel, {"load_full_w2": load_full_w2})
+
+        if self.strategy == "channel":
+            w13_scale_group = torch.nn.Parameter(
+                torch.ones(
+                    [],
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            w2_scale_group = torch.nn.Parameter(
+                torch.ones(
+                    [],
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+        else:
+            w13_scale_group = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            w2_scale_group = torch.nn.Parameter(
+                torch.ones(
+                    num_experts, 
+                    num_groups_w2, 
+                    hidden_size, 
+                    dtype=params_dtype
+                ),
+                requires_grad=False,
+            ) 
+        layer.register_parameter("w13_scale_group_", w13_scale_group)
+        set_weight_attrs(w13_scale_group, extra_weight_attrs)
+        layer.register_parameter("w2_scale_group_", w2_scale_group)
+        set_weight_attrs(w2_scale_group, extra_weight_attrs)
+
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        w13_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_g_idx", w13_g_idx)
+        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+
+        w2_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_g_idx", w2_g_idx)
+        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+
+        w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
+
+        w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+
+        # only support dynamice activation quantization for now
+        layer.a13_scale = None
+        layer.a2_scale = None
+        layer.marlin_state = GPTQMarlinState.REPACK
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+
+        def replace_tensor(name, new_t):
+            # It is important to use resize_() here since it ensures
+            # the same buffer is reused
+            getattr(layer, name).resize_(new_t.shape)
+            getattr(layer, name).copy_(new_t)
+            del new_t
+
+        def get_scale_perms(num_bits: int):
+            scale_perm: List[int] = []
+            for i in range(8):
+                scale_perm.extend([i + 8 * j for j in range(8)])
+            scale_perm_single: List[int] = []
+            for i in range(4):
+                scale_perm_single.extend(
+                    [2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]]
+                )
+            return scale_perm, scale_perm_single
+
+        def marlin_permute_scales(
+            s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
+        ):
+            scale_perm, scale_perm_single = get_scale_perms(num_bits)
+            if group_size < size_k and group_size != -1:
+                s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+            else:
+                s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+            s = s.reshape((-1, size_n)).contiguous()
+            return s
+
+        def marlin_moe_permute_scales(
+            s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
+        ):
+            num_experts = s.shape[0]
+            output = torch.empty(
+                (num_experts, s.shape[1], s.shape[2]), device=s.device, dtype=s.dtype
+            )
+            for e in range(num_experts):
+                output[e] = marlin_permute_scales(
+                    s[e], size_k, size_n, group_size, num_bits
+                )
+            return output
+
+        size_k2 = layer.w2_weight_packed.shape[2]
+        size_k13 = layer.w13_weight_packed.shape[2]
+
+        num_experts = layer.w13_weight_g_idx.shape[0]
+        device = layer.w13_weight_g_idx.device
+
+        # when running models with grouped act order,
+        # resort to g_idx values provided in checkpoint
+
+        layer.w13_weight_g_idx = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+        layer.w2_weight_g_idx = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+        layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+        layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+
+        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+            layer.w13_weight_packed,
+            layer.w13_g_idx_sort_indices,
+            layer.w13_weight_packed.shape[1] * self.packed_factor,
+            layer.w13_weight_packed.shape[2],
+            self.num_bits,
+        )
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
+        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+            layer.w2_weight_packed,
+            layer.w2_g_idx_sort_indices,
+            layer.w2_weight_packed.shape[1] * self.packed_factor,
+            layer.w2_weight_packed.shape[2],
+            self.num_bits,
+        )
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+        
+        # Repack scales
+        if self.strategy != "channel":
+            marlin_w13_scales_group = marlin_moe_permute_scales(
+                layer.w13_scale_group,
+                size_k13,
+                layer.w13_scale_group.shape[2],
+                self.group_size,
+                self.num_bits,
+            )
+            replace_tensor("w13_scale_group", marlin_w13_scales_group)
+            marlin_w2_scales_group = marlin_moe_permute_scales(
+                layer.w2_scale_group,
+                layer.w2_scale_group.shape[1]
+                * (self.group_size if self.group_size != -1 else self.packed_factor),
+                size_k2,
+                self.group_size,
+                self.num_bits,
+            )
+            replace_tensor("w2_scale_group", marlin_w2_scales_group)
+        
+        marlin_w13_scales_channel = marlin_moe_permute_scales(
+            layer.w13_scale_channel,
+            size_k13,
+            layer.w13_scale_channel.shape[2],
+            self.group_size,
+            self.num_bits,
+        )
+        replace_tensor("w13_scale_channel", marlin_w13_scales_channel)
+        marlin_w2_scales_channel = marlin_moe_permute_scales(
+            layer.w2_scale_channel,
+            layer.w2_scale_channel.shape[1] * self.packed_factor,
+            size_k2,
+            self.group_size,
+            self.num_bits,
+        )
+        replace_tensor("w2_scale_channel", marlin_w2_scales_channel)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.moe.topk import select_experts
+
+        assert activation == "silu", "Only SiLU activation is supported."
+        if expert_map is not None:
+            raise NotImplementedError(
+                "Expert Parallelism is not supported for " "fused Marlin MoE method."
+            )
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            correction_bias=correction_bias,
+        )
+
+        return fused_marlin_w4a8_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale_channel,
+            layer.w2_weight_scale_channel,
+            layer.w13_weight_scale_group,
+            layer.w2_weight_scale_group,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
         )

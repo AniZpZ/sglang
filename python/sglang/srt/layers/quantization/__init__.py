@@ -17,6 +17,7 @@ try:
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
         CompressedTensorsWNA16MoEMethod,
+        Compressed
     )
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
@@ -326,6 +327,7 @@ def monkey_patch_quant_configs():
     monkey_patch_moe_apply(GPTQMarlinMoEMethod)
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
+    monkey_patch_moe_apply(CompressedTensorsW4A8MoEMethod)
 
 
 # Only apply monkey patches if vllm is available

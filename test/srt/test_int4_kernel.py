@@ -10,7 +10,11 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (mar
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.scalar_type import scalar_types
 from vllm.model_executor.layers.activation import SiluAndMul
-from sgl_kernel import fused_marlin_moe
+from sgl_kernel import fused_marlin_moe, fused_marlin_w4a8_moe
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+)
 
 def stack_and_dev(tensors: list[torch.Tensor]):
     dev = tensors[0].device
@@ -171,6 +175,88 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
         num_bits=num_bits,
         is_k_full=True)
     return marlin_output, torch_output
+
+
+def fused_marlin_w4a8_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score, topk, ):
+    w_ref1_l = []
+    qweight1_l = []
+    scales1_l = []
+    zeros1_l = []
+    g_idx1_l = []
+    sort_indices1_l = []
+    s1_l = []
+    for i in range(w1.shape[0]):
+        test_perm = torch.randperm(n=K)
+        quant_res = marlin_quantize(w1[i].transpose(1, 0), quant_type,
+                                    group_size, act_order, test_perm)
+        w_ref1, qweight1, scales1, g_idx1, sort_indices1, _ = quant_res
+        w_ref1_l.append(w_ref1.T)
+        qweight1_l.append(qweight1)
+        scales1_l.append(scales1)
+        g_idx1_l.append(g_idx1)
+        sort_indices1_l.append(sort_indices1)
+    w_ref1 = stack_and_dev(w_ref1_l)
+    qweight1 = stack_and_dev(qweight1_l).contiguous()
+    scales1_c = stack_and_dev(scales1_l)
+    g_idx1 = stack_and_dev(g_idx1_l) if g_idx1_l else None
+    zeros1 = stack_and_dev(zeros1_l) if zeros1_l else None
+    sort_indices1 = stack_and_dev(sort_indices1_l) if sort_indices1_l else None
+
+    w_ref2_l = []
+    qweight2_l = []
+    scales2_l = []
+    zeros2_l = []
+    g_idx2_l = []
+    sort_indices2_l = []
+    for i in range(w2.shape[0]):
+        test_perm = torch.randperm(n=N)
+        quant_res = marlin_quantize(w2[i].transpose(1, 0), quant_type,
+                                    group_size, act_order, test_perm)
+        w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = quant_res
+
+        w_ref2_l.append(w_ref2.T)
+        qweight2_l.append(qweight2)
+        scales2_l.append(scales2)
+        g_idx2_l.append(g_idx2)
+        sort_indices2_l.append(sort_indices2)
+
+    w_ref2 = stack_and_dev(w_ref2_l)
+    qweight2 = stack_and_dev(qweight2_l).contiguous()
+    scales2_c = stack_and_dev(scales2_l)
+    g_idx2 = stack_and_dev(g_idx2_l) if g_idx2_l else None
+    zeros2 = stack_and_dev(zeros2_l) if zeros2_l else None
+    sort_indices2 = stack_and_dev(sort_indices2_l) if sort_indices2_l else None
+
+    topk_weights, topk_ids = fused_topk(a, score, topk, False)
+
+    e_map = None
+    scales1_g = None
+    scales2_g = None
+    q_a, a_scale = per_token_quant_int8(a)
+    torch_output = torch_moe(a, w_ref1, w_ref2, score, topk, e_map)
+    marlin_output = fused_marlin_w4a8_moe(
+        q_a,
+        a_scale,
+        qweight1,
+        qweight2,
+        scales1_c,
+        scales2_c,
+        scales1_g,
+        scales2_g,
+        score,
+        topk_weights,
+        topk_ids,
+        global_num_experts=E,
+        expert_map=e_map,
+        g_idx1=g_idx1,
+        g_idx2=g_idx2,
+        sort_indices1=sort_indices1,
+        sort_indices2=sort_indices2,
+        w1_zeros=zeros1,
+        w2_zeros=zeros2,
+        is_k_full=True)
+    return marlin_output, torch_output
+
 
 class TestW8A8Int8FusedMoE(unittest.TestCase):
     DTYPES = [torch.bfloat16]

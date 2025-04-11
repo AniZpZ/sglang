@@ -305,6 +305,34 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
 
+    def _is_w4a8_group_channel(
+        self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # Confirm weight scheme is supported.
+        is_w_4_bits = weight_quant.num_bits == 4
+        is_a_8bits = input_quant.num_bits == 8
+        is_symmetric_weight = weight_quant.symmetric
+        is_channel_group = (
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value
+        )
+        if not (
+            is_w_4_bits
+            and is_a_8bits
+            and is_symmetric_weight
+            and is_channel_group
+        ):
+            return False
+
+        # Confirm activation scheme is supported.
+        is_symmetric_activation = input_quant.symmetric
+        is_per_token_activation = input_quant.strategy == QuantizationStrategy.TOKEN
+        return is_symmetric_activation and is_per_token_activation
+
+
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.
         if weight_quant is None:
@@ -418,6 +446,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     strategy=weight_quant.strategy,
                     is_static_input_scheme=False,
                     input_symmetric=input_quant.symmetric,
+                )
+            
+            if self._is_w4a8_group_channel(weight_quant, input_quant):
+                return CompressedTensorsW4A8(
+                    strategy=weight_quant.strategy,
+                    is_static_input_scheme=is_static_input_scheme,           
                 )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
