@@ -451,6 +451,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             if self._is_w4a8_group_channel(weight_quant, input_quant):
                 return CompressedTensorsW4A8(
                     strategy=weight_quant.strategy,
+                    s_static_input_scheme=False,
                     is_static_input_scheme=is_static_input_scheme,           
                 )
 

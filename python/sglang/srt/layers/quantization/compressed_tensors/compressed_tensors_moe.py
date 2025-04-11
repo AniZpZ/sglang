@@ -76,10 +76,10 @@ class CompressedTensorsMoEMethod:
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm"
-                )
+            # if not VLLM_AVAILABLE:
+            #     raise ImportError(
+            #         "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm"
+            #     )
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_w4a8_group_channel(weight_quant, input_quant):
             return CompressedTensorsW4A8MoEMethod(quant_config)
@@ -648,10 +648,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        if not VLLM_AVAILABLE:
-            raise ImportError(
-                "vllm is not installed, to use fused_marlin_moe, please install vllm"
-            )
+        # if not VLLM_AVAILABLE:
+        #     raise ImportError(
+        #         "vllm is not installed, to use fused_marlin_moe, please install vllm"
+        #     )
         if expert_map is not None:
             raise NotImplementedError(
                 "Expert Parallelism is not supported for " "fused Marlin MoE method."
