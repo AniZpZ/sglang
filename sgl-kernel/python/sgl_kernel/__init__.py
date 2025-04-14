@@ -22,6 +22,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+from sgl_kernel.fused_moe import fused_marlin_moe, fused_marlin_w4a8_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -50,7 +51,6 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
-from sgl_kernel.fused_moe import fused_marlin_moe, fused_marlin_w4a8_moe
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

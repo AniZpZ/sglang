@@ -306,7 +306,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_symmetric_activation and is_per_tensor_activation
 
     def _is_w4a8_group_channel(
-        self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
         # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False
@@ -320,10 +321,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         if not (
-            is_w_4_bits
-            and is_a_8bits
-            and is_symmetric_weight
-            and is_channel_group
+            is_w_4_bits and is_a_8bits and is_symmetric_weight and is_channel_group
         ):
             return False
 
@@ -331,7 +329,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_symmetric_activation = input_quant.symmetric
         is_per_token_activation = input_quant.strategy == QuantizationStrategy.TOKEN
         return is_symmetric_activation and is_per_token_activation
-
 
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.
@@ -447,12 +444,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     is_static_input_scheme=False,
                     input_symmetric=input_quant.symmetric,
                 )
-            
+
             if self._is_w4a8_group_channel(weight_quant, input_quant):
                 return CompressedTensorsW4A8(
                     strategy=weight_quant.strategy,
                     s_static_input_scheme=False,
-                    is_static_input_scheme=is_static_input_scheme,           
+                    is_static_input_scheme=is_static_input_scheme,
                 )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")

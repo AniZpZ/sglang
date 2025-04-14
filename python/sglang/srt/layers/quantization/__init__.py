@@ -15,9 +15,9 @@ try:
     )
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        CompressedTensorsW4A8MoEMethod,
         CompressedTensorsW8A8Fp8MoEMethod,
         CompressedTensorsWNA16MoEMethod,
-        CompressedTensorsW4A8MoEMethod
     )
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config

@@ -1,24 +1,29 @@
 import itertools
+import sys
 import unittest
 
 import torch
 
-import sys
 sys.path.insert(0, "/home/hadoop-hmart-waimai-rank/vllm")
 
-from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (marlin_quantize)
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-from vllm.scalar_type import scalar_types
-from vllm.model_executor.layers.activation import SiluAndMul
 from sgl_kernel import fused_marlin_moe, fused_marlin_w4a8_moe
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
+from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
+    marlin_quantize,
+)
+from vllm.scalar_type import scalar_types
+
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
 )
 
+
 def stack_and_dev(tensors: list[torch.Tensor]):
     dev = tensors[0].device
     return torch.stack(tensors, dim=0).to(dev)
+
 
 def torch_moe(a, w1, w2, score, topk, expert_map):
     B, D = a.shape
@@ -33,10 +38,13 @@ def torch_moe(a, w1, w2, score, topk, expert_map):
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            out[mask] = SiluAndMul()(
-                a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
-    return (out.view(B, -1, w2.shape[1]) *
-            topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+            out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
+                0, 1
+            )
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
+
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
@@ -99,7 +107,20 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
 
-def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score, topk, ):
+
+def marlin_fused_moe(
+    N,
+    E,
+    K,
+    a,
+    w1,
+    w2,
+    num_bits,
+    group_size,
+    act_order,
+    score,
+    topk,
+):
     quant_type = scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
     w_ref1_l = []
     qweight1_l = []
@@ -110,8 +131,9 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
     s1_l = []
     for i in range(w1.shape[0]):
         test_perm = torch.randperm(n=K)
-        quant_res = marlin_quantize(w1[i].transpose(1, 0), quant_type,
-                                    group_size, act_order, test_perm)
+        quant_res = marlin_quantize(
+            w1[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
+        )
         w_ref1, qweight1, scales1, g_idx1, sort_indices1, _ = quant_res
         w_ref1_l.append(w_ref1.T)
         qweight1_l.append(qweight1)
@@ -133,8 +155,9 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
     sort_indices2_l = []
     for i in range(w2.shape[0]):
         test_perm = torch.randperm(n=N)
-        quant_res = marlin_quantize(w2[i].transpose(1, 0), quant_type,
-                                    group_size, act_order, test_perm)
+        quant_res = marlin_quantize(
+            w2[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
+        )
         w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = quant_res
 
         w_ref2_l.append(w_ref2.T)
@@ -173,11 +196,22 @@ def marlin_fused_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score,
         w1_zeros=zeros1,
         w2_zeros=zeros2,
         num_bits=num_bits,
-        is_k_full=True)
+        is_k_full=True,
+    )
     return marlin_output, torch_output
 
 
-def fused_marlin_w4a8_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, score, topk, ):
+def fused_marlin_w4a8_moe(
+    N,
+    E,
+    K,
+    a,
+    w1,
+    w2,
+    group_size,
+    score,
+    topk,
+):
     w_ref1_l = []
     qweight1_l = []
     scales1_l = []
@@ -187,8 +221,9 @@ def fused_marlin_w4a8_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, s
     s1_l = []
     for i in range(w1.shape[0]):
         test_perm = torch.randperm(n=K)
-        quant_res = marlin_quantize(w1[i].transpose(1, 0), quant_type,
-                                    group_size, act_order, test_perm)
+        quant_res = marlin_quantize(
+            w1[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
+        )
         w_ref1, qweight1, scales1, g_idx1, sort_indices1, _ = quant_res
         w_ref1_l.append(w_ref1.T)
         qweight1_l.append(qweight1)
@@ -210,8 +245,9 @@ def fused_marlin_w4a8_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, s
     sort_indices2_l = []
     for i in range(w2.shape[0]):
         test_perm = torch.randperm(n=N)
-        quant_res = marlin_quantize(w2[i].transpose(1, 0), quant_type,
-                                    group_size, act_order, test_perm)
+        quant_res = marlin_quantize(
+            w2[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
+        )
         w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = quant_res
 
         w_ref2_l.append(w_ref2.T)
@@ -254,7 +290,8 @@ def fused_marlin_w4a8_moe(N, E, K, a, w1, w2, num_bits, group_size, act_order, s
         sort_indices2=sort_indices2,
         w1_zeros=zeros1,
         w2_zeros=zeros2,
-        is_k_full=True)
+        is_k_full=True,
+    )
     return marlin_output, torch_output
 
 
@@ -268,6 +305,7 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
     BLOCK_SIZE = [[128, 128]]
     SEEDS = [0]
     NUM_BITS = [4]
+
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
@@ -285,10 +323,24 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
-            marlin_out, ref_out = marlin_fused_moe(N=N, E=E, K=K, a=a, w1=w1_fp16, w2=w2_fp16, num_bits=num_bits, group_size=-1, act_order=False, score=score, topk=topk, )
+            marlin_out, ref_out = marlin_fused_moe(
+                N=N,
+                E=E,
+                K=K,
+                a=a,
+                w1=w1_fp16,
+                w2=w2_fp16,
+                num_bits=num_bits,
+                group_size=-1,
+                act_order=False,
+                score=score,
+                topk=topk,
+            )
         # Check results
         self.assertTrue(
-            torch.mean(torch.abs(marlin_out.to(torch.float32) - ref_out.to(torch.float32)))
+            torch.mean(
+                torch.abs(marlin_out.to(torch.float32) - ref_out.to(torch.float32))
+            )
             / torch.mean(torch.abs(ref_out.to(torch.float32)))
             < 0.1
         )

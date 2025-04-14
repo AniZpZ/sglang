@@ -689,9 +689,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
 
 class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
-    def __init__(
-        self, quant_config: "CompressedTensorsConfig"
-    ):
+    def __init__(self, quant_config: "CompressedTensorsConfig"):
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoEMethodBase,
             FusedMoeWeightScaleSupported,
@@ -701,13 +699,17 @@ class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
         weight_config = self.quant_config.target_scheme_map["Linear"].get("weights")
-        input_config = self.quant_config.target_scheme_map["Linear"].get("input_activations")
+        input_config = self.quant_config.target_scheme_map["Linear"].get(
+            "input_activations"
+        )
         self.num_bits = weight_config.num_bits
         self.packed_factor = 32 // weight_config.num_bits
         self.strategy = weight_config.strategy
         self.group_size = weight_config.group_size
 
-        assert weight_config.symmetric, "Only symmetric quantization is supported for W4A8 for now"
+        assert (
+            weight_config.symmetric
+        ), "Only symmetric quantization is supported for W4A8 for now"
         assert self.num_bits == 4, "Only 4 bit weight is supported for W4A8"
         self.act_num_bits = input_config.num_bits
         assert self.act_num_bits == 8, "Only 8 bit activations are supported for W4A8"
@@ -765,9 +767,7 @@ class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
         #     intermediate_size_full if load_full_w2 else intermediate_size_per_partition
         # )
 
-        self.is_k_full = (
-            intermediate_size_per_partition == intermediate_size_full
-        )
+        self.is_k_full = intermediate_size_per_partition == intermediate_size_full
 
         # register scales
         if self.strategy == "channel":
@@ -823,14 +823,9 @@ class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             w2_scale_group = torch.nn.Parameter(
-                torch.ones(
-                    num_experts, 
-                    num_groups_w2, 
-                    hidden_size, 
-                    dtype=params_dtype
-                ),
+                torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
                 requires_grad=False,
-            ) 
+            )
         layer.register_parameter("w13_scale_group_", w13_scale_group)
         set_weight_attrs(w13_scale_group, extra_weight_attrs)
         layer.register_parameter("w2_scale_group_", w2_scale_group)
@@ -983,7 +978,7 @@ class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
             self.num_bits,
         )
         replace_tensor("w2_weight_packed", marlin_w2_qweight)
-        
+
         # Repack scales
         if self.strategy != "channel":
             marlin_w13_scales_group = marlin_moe_permute_scales(
@@ -1003,7 +998,7 @@ class CompressedTensorsW4A8MoEMethod(CompressedTensorsMoEMethod):
                 self.num_bits,
             )
             replace_tensor("w2_scale_group", marlin_w2_scales_group)
-        
+
         marlin_w13_scales_channel = marlin_moe_permute_scales(
             layer.w13_scale_channel,
             size_k13,
