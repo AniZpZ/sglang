@@ -5,7 +5,8 @@ import uuid
 import numpy as np
 import websockets
 import time
-from moviepy.editor import VideoFileClip
+from moviepy import *
+import json
 
 import tempfile
 import librosa
@@ -45,9 +46,9 @@ def get_video_chunk_content(video_path, flatten=True):
         image = Image.fromarray((frame).astype(np.uint8))
         audio = audio_np[sr * i:sr * (i + 1)]
         if flatten:
-            contents.extend([image, audio])
+            contents.append((image, audio))
         else:
-            contents.append([image, audio])
+            contents.append((image, audio))
 
     return contents
 
@@ -56,11 +57,13 @@ multi_modal_contents = get_video_chunk_content(video_path)
 
 
 async def ws_client(url):
-    async with websockets.connect(url) as websocket:
+    async with websockets.connect(url, max_size=2**22, read_limit=2**22, write_limit=2**22) as websocket:
         # open session package
-        session_id = uuid.UUID
-        json = {"capacity_of_str_len": 1000, "session_id": session_id}
-        await websocket.send(json),
+
+        json_map = {"capacity_of_str_len": 1000, "session_id": (str(uuid.uuid1()))}
+        print(json_map)
+        json_str =json.dumps(json_map)
+        await websocket.send(json_str)
 
         # first prompt package
         prompt_package = {
@@ -74,14 +77,16 @@ async def ws_client(url):
                 ],
             }],
             "max_completion_tokens": 200,
-            "temperature":0.0
+            "temperature":0.0,
+            "model": "/home/admin/openbmb__MiniCPM-o-2_6"
         }
-        await websocket.send(prompt_package)
+        await websocket.send(json.dumps(prompt_package))
 
         # multimodal package
         for image, audio in multi_modal_contents:
             image_base64 = image_to_base64(image)
             audio_base64 = audio_to_base64(audio)
+
 
             multi_modal_package = {
                 "messages":[{
@@ -102,10 +107,11 @@ async def ws_client(url):
                     ],
                 }],
                 "max_completion_tokens": 200,
-                "temperature":0.0
+                "temperature":0.0,
+                "model": "/home/admin/openbmb__MiniCPM-o-2_6"
             }
 
-            await websocket.send(multi_modal_package)
+            await websocket.send(json.dumps(multi_modal_package))
             time.sleep(1)
 
 

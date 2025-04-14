@@ -1231,7 +1231,8 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None and (self.server_args.
-            enable_multimodal_streaming_input and len(self.streaming_input_prefill_batch) ==0):
+                                                enable_multimodal_streaming_input and len(
+            self.streaming_input_prefill_batch) == 0):
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1265,7 +1266,9 @@ class Scheduler(
         if self.streaming_input_prefill_batch is not None:
             for streaming_input_req in self.streaming_input_prefill_batch:
                 streaming_input_req.init_next_round_input()
-                adder.add_chunked_req(streaming_input_req)
+                if streaming_input_req.extend_input_len == 0:
+                    continue
+                adder.add_one_req(streaming_input_req, False)
                 streaming_input_req.has_computed_package_size = len(
                     streaming_input_req.multimodal_stream_inputs)
 
@@ -1277,10 +1280,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1300,8 +1303,8 @@ class Scheduler(
             )
 
             if self.server_args.enable_multimodal_streaming_input:
-                if res.multimodal_stream_inputs:
-                    self.streaming_input_prefill_batch.append(res)
+                if not req.commit:
+                    self.streaming_input_prefill_batch.append(req)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1310,9 +1313,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                                                               self.running_batch is not None
+                                                               and not self.running_batch.is_empty()
+                                                           )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1516,8 +1519,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 

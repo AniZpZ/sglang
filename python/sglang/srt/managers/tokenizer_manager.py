@@ -334,6 +334,29 @@ class TokenizerManager:
                 self.server_args.disaggregation_bootstrap_port
             )
 
+    async def send_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ):
+        created_time = time.time()
+
+        self.auto_create_handle_loop()
+        obj.normalize_batch_and_arguments()
+        if self.log_requests:
+            max_length, skip_names, _ = self.log_request_metadata
+            logger.info(
+                f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+            )
+
+        tokenized_obj = self._tokenize_one_request(obj)
+
+        tokenized_obj.streaming_input = request['streaming_input']
+        tokenized_obj.commit = request['commit']
+        self._send_one_request(obj, tokenized_obj, created_time)
+
+
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -360,17 +383,13 @@ class TokenizerManager:
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
             if is_single:
+
                 tokenized_obj = await self._tokenize_one_request(obj)
-                streaming_input = False
-                commit = False
-                if hasattr(obj, 'streaming_input'):
-                    streaming_input = obj['streaming_input']
-                    tokenized_obj.streaming_input = streaming_input
-                if hasattr(obj, 'commit'):
-                    commit = obj['commit']
-                    tokenized_obj.commit = commit
+
+                tokenized_obj.streaming_input = request['streaming_input']
+                tokenized_obj.commit = request['commit']
                 self._send_one_request(obj, tokenized_obj, created_time)
-                if streaming_input and not commit:
+                if request['streaming_input'] and not request['commit']:
                     return
                 async for response in self._wait_one_response(obj, request):
                     yield response

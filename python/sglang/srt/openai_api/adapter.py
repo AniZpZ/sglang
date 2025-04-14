@@ -907,6 +907,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    session_params_list = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1070,6 +1071,7 @@ def v1_chat_generate_request(
         image_data_list.append(image_data)
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
+        session_params_list.append(request.session_params)
     if len(all_requests) == 1:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1087,6 +1089,7 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
+        session_params_list = session_params_list[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1110,10 +1113,10 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+        session_params=session_params_list
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
-
 
 def v1_chat_generate_response(
     request,
@@ -1308,22 +1311,35 @@ def v1_chat_generate_response(
         )
         return response
 
+
 async def v1_chat_completions_streaming(
-    tokenizer_manager, raw_request: Request, cache_report=False, first_package=False
+    tokenizer_manager, raw_request: Request,  cache_report=False, first_package=False,
 ):
-    request_json = await raw_request.json()
+    if isinstance(raw_request, Request):
+        request_json = raw_request.json()
+    else:
+        request_json = raw_request
     all_requests = [ChatCompletionRequest(**request_json)]
+
+
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
-    tokenizer_manager.generate_request(
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, request_ids=request_json['request_id'])
+    # print(adapted_request)
+
+
+    await tokenizer_manager.send_request(
         adapted_request, raw_request
     )
+
 
 
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    request_json = await raw_request.json()
+    if isinstance(raw_request, Request):
+        request_json = await raw_request.json()
+    else:
+        request_json = raw_request
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)

@@ -22,33 +22,48 @@ async def streaming_input_handler(websocket):
     open_session_str = await websocket.recv()
     open_session_data = json.loads(open_session_str)
     open_session_obj = OpenSessionReqInput(**open_session_data)
+    session_id = None
     try:
         session_id = await _global_state.tokenizer_manager.open_session(open_session_obj, None)
+        print(session_id)
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
             )
     except Exception as e:
         websocket.send(_create_error_response(e))
-
+    index = 0
     while True:
+        index += 1
         raw_data = await websocket.recv()
         raw_json = json.loads(raw_data)
-        if 'commit' not in raw_json['raw_json']:
-            await v1_chat_completions_streaming(_global_state.tokenizer_manager, raw_data)
+        print(raw_json)
+        print(index)
+        raw_json['request_id'] = session_id
+
+        session_params = {
+            "id": session_id,
+            "rid": session_id,
+        }
+
+        raw_json['session_params'] = session_params
+
+        if "commit" in raw_json.keys() and raw_json["commit"]:
+            raw_json['streaming_input'] = True
+            raw_json['commit'] = True
+            await v1_chat_completions(_global_state.tokenizer_manager, raw_json)
+            #     await websocket.send(resp)
+            # break
         else:
-            for resp in v1_chat_completions(_global_state.tokenizer_manager, raw_data):
-                await websocket.send(resp)
-            break
-
-
+            raw_json['streaming_input'] = True
+            raw_json['commit'] = False
+            await v1_chat_completions_streaming(_global_state.tokenizer_manager, raw_json)
 
     close_session_obj = CloseSessionReqInput(session_id=open_session_obj.session_id)
     try:
         await _global_state.tokenizer_manager.close_session(close_session_obj, None)
     except Exception as e:
         return _create_error_response(e)
-
 
 
 def launch_realtime_server(
@@ -80,7 +95,7 @@ def launch_realtime_server(
     )
 
     async def run_sglang_websocket_server():
-        async with websockets.serve(streaming_input_handler, "localhost", server_args.port):
+        async with websockets.serve(streaming_input_handler, "0.0.0.0", server_args.port, max_size=2 ** 22):
             await asyncio.Future()
 
     asyncio.run(run_sglang_websocket_server())

@@ -72,7 +72,15 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
-                if req.is_chunked <= 0:
+                if not req.commit or req.has_computed_package_size < len(req.multimodal_stream_inputs):
+                    if time.time() - req.last_add_time > 30:
+                        req.to_abort = True
+                        req.to_abort_message = "streaming input timeout"
+                        req.check_finished()
+                    else:
+                        skip_stream_req_list.append(req)
+
+                elif req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -118,13 +126,6 @@ class SchedulerOutputProcessorMixin:
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
-                elif not req.commit or req.has_computed_package_size < len(req.multimodal_stream_inputs):
-                    if time.time() - req.last_add_time > 30:
-                        req.to_abort = True
-                        req.to_abort_message = "streaming input timeout"
-                        req.check_finished()
-                    else:
-                        skip_stream_req_list.append(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1

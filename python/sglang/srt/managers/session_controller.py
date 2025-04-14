@@ -69,7 +69,9 @@ class Session:
     def create_streaming_input_req(self, req_input: TokenizedGenerateReqInput, tokenizer):
         assert req_input.session_params is not None
         session_params = req_input.session_params
-        req_node = self.req_nodes[session_params.rid]
+        req_node = None
+        if session_params.rid in self.req_nodes.keys():
+            req_node = self.req_nodes[session_params.rid]
 
 
         if req_node is None:
@@ -89,6 +91,7 @@ class Session:
                 top_logprobs_num=req_input.top_logprobs_num,
                 token_ids_logprob=req_input.token_ids_logprob,
             )
+            new_req.multimodal_stream_inputs = []
             new_req_node = SessionReqNode(new_req, None)
             self.req_nodes[req_input.rid] = new_req_node
 
