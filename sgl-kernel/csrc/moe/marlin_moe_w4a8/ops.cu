@@ -355,53 +355,73 @@ void marlin_w4a8_mm(
 }  // namespace MARLIN_W4A8_NAMESPACE_NAME
 
 torch::Tensor moe_w4a8_marlin_gemm(
-    torch::Tensor& a, torch::Tensor& a_scale,
-    std::optional<torch::Tensor> const& c_or_none,
-    torch::Tensor& b_q_weight, torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
-    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
-    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
-    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights, bool is_ep,
-    sglang::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
-    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float) {
-  sglang::ScalarType const b_q_type = sglang::ScalarType::from_id(b_q_type_id);
-  int pack_factor = 32 / b_q_type.size_bits();
+  const torch::Tensor& a,
+  const torch::Tensor& b,
+        torch::Tensor& d_or_none,
+  const torch::Tensor& s1,
+  const torch::Tensor& s2,
+  const torch::Tensor& s3,
+  torch::Tensor& sorted_token_ids,           //moe
+  torch::Tensor& expert_ids,
+  torch::Tensor& num_tokens_past_padded,
+  torch::Tensor& topk_weights,
+  int64_t moe_block_size, 
+  int64_t top_k,
+  bool mul_topk_weights,
+  bool is_ep,                                //moe
+  torch::Tensor& workspace,
+  int64_t prob_m,
+  int64_t prob_n,
+  int64_t prob_k,
+) {
 
-  // Verify A
-  TORCH_CHECK(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0),
-              ", size_m = ", size_m);
-  TORCH_CHECK(a.size(1) == size_k, "Shape mismatch: a.size(1) = ", a.size(1),
-              ", size_k = ", size_k);
+  // int prob_m = a.size(0);
+  // int prob_n = C.size(1);
+  // int prob_k = a.size(1);
+  int pack_factor = 32 / 4;
 
-  // Verify B
-  TORCH_CHECK(
-      size_k % MARLIN_NAMESPACE_NAME::tile_size == 0, "size_k = ", size_k,
-      " is not divisible by tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
-  TORCH_CHECK((size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1),
-              "Shape mismatch: b_q_weight.size(1) = ", b_q_weight.size(1),
-              ", size_k = ", size_k,
-              ", tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
-  TORCH_CHECK(
-      b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0,
-      "b_q_weight.size(2) = ", b_q_weight.size(2),
-      " is not divisible by tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
-  int actual_size_n =
-      (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
-  TORCH_CHECK(size_n == actual_size_n, "size_n = ", size_n,
-              ", actual_size_n = ", actual_size_n);
+  int groupsize = (s3.numel() == 0) ? -1 : prob_k / s3.size(0);
+  if (groupsize != -1 && groupsize * s3.size(0) != prob_k)
+    AT_ERROR("k=", prob_k, " not compatible with ", s3.size(0), " groups.");
+  if (workspace.numel() < prob_n / 128 * max_par)
+    AT_ERROR("workspace must be of size at least ", prob_n / 128 * max_par, ".");
+  if (s1.dtype() != torch::kFloat32)
+     AT_ERROR("s1 dtype must be float32, but got ", s1.dtype(), ".");
+  if (s2.dtype() != torch::kFloat32)
+     AT_ERROR("s2 dtype must be float32, but got ", s2.dtype(), ".");
+  if (s3.dtype() != torch::kFloat16)
+     AT_ERROR("s3 dtype must be float16, but got ", s3.dtype(), ".");
 
   // Verify device and strides
   TORCH_CHECK(a.device().is_cuda(), "A is not on GPU");
   TORCH_CHECK(a.is_contiguous(), "A is not contiguous");
+  TORCH_CHECK(a.size(0) == prob_m, "Shape mismatch: a.size(0) = ", a.size(0),
+              ", prob_m = ", prob_m);
+  TORCH_CHECK(a.size(1) == prob_k, "Shape mismatch: a.size(1) = ", a.size(1),
+              ", prob_k = ", prob_k);
 
-  TORCH_CHECK(b_q_weight.device().is_cuda(), "b_q_weight is not on GPU");
-  TORCH_CHECK(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
+  TORCH_CHECK(b.device().is_cuda(), "b_q_weight is not on GPU");
+  TORCH_CHECK(b.is_contiguous(), "b_q_weight is not contiguous");
+  // Verify B
+  TORCH_CHECK(
+      prob_k % tile_size == 0, "prob_k = ", prob_k,
+      " is not divisible by tile_size = ", tile_size);
+  TORCH_CHECK((prob_k / tile_size) == b.size(1),
+              "Shape mismatch: b_q_weight.size(1) = ", b.size(1),
+              ", prob_k = ", prob_k,
+              ", tile_size = ", tile_size);
+  TORCH_CHECK(
+      b.size(2) % tile_size == 0,
+      "b.size(2) = ", b.size(2),
+      " is not divisible by tile_size = ", tile_size);
+  int actual_size_n =
+      (b.size(2) / tile_size) * pack_factor;
+  TORCH_CHECK(prob_n == actual_size_n, "prob_n = ", prob_n,
+              ", actual_size_n = ", actual_size_n);
+            
 
-  TORCH_CHECK(b_scales.device().is_cuda(), "b_scales is not on GPU");
-  TORCH_CHECK(b_scales.is_contiguous(), "b_scales is not contiguous");
+  TORCH_CHECK(s3.device().is_cuda(), "b_scales is not on GPU");
+  TORCH_CHECK(s3.is_contiguous(), "b_scales is not contiguous");
 
   // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
   // auto -1)
@@ -414,98 +434,39 @@ torch::Tensor moe_w4a8_marlin_gemm(
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.get_device());
 
   // Alloc buffers
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of());
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
-  torch::Tensor c;
-  if (c_or_none.has_value()) {
-    c = c_or_none.value();
-    TORCH_CHECK(c.device().is_cuda(), "c is not on GPU");
-    TORCH_CHECK(c.is_contiguous(), "c is not contiguous");
-    TORCH_CHECK(c.size(0) == size_m * top_k,
-                "Shape mismatch: c.size(0) = ", c.size(0),
-                ", size_m * topk = ", size_m * top_k);
-    TORCH_CHECK(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1),
-                ", size_n = ", size_n);
+  torch::Tensor d;
+  if (d_or_none.has_value()) {
+    d = d_or_none.value();
+    TORCH_CHECK(d.device().is_cuda(), "d is not on GPU");
+    TORCH_CHECK(d.is_contiguous(), "d is not contiguous");
+    TORCH_CHECK(d.size(0) == prob_m * top_k,
+                "Shape mismatch: d.size(0) = ", d.size(0),
+                ", prob_m * topk = ", prob_m * top_k);
+    TORCH_CHECK(d.size(1) == prob_n, "Shape mismatch: d.size(1) = ", d.size(1),
+                ", prob_n = ", prob_n);
   } else {
-    c = torch::empty({size_m * top_k, size_n}, options);
+    d = torch::empty({prob_m * top_k, prob_n}, options);
   }
+
 
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
-  auto options_fp32 =
-      torch::TensorOptions().dtype(at::kFloat).device(a.device());
-  if (use_fp32_reduce && !use_atomic_add) {
-    const long max_c_tmp_size =
-        min(((long)size_n * sorted_token_ids.size(0)),
-            (long)(sms * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n));
-    c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
-  } else {
-    c_tmp = torch::empty({0}, options_fp32);
-  }
+  auto options_int32 =
+      torch::TensorOptions().dtype(at::kInt).device(a.device());  // Using kInt for int32
+  const long max_c_tmp_size =
+          min(((long)prob_n * sorted_token_ids.size(0)),
+              (long)(sms * moe_block_size * max_thread_n));
+  c_tmp = torch::empty({max_c_tmp_size}, options_int32);  // Using int32 tensor
 
-  // Detect groupsize and act_order
-  int num_groups = -1;
-  int group_size = -1;
-
-  int rank = b_scales.sizes().size();
-  TORCH_CHECK(rank == 3, "b_scales rank = ", rank, " is not 3");
-  TORCH_CHECK(b_scales.size(2) == size_n, "b_scales dim 2 = ", b_scales.size(2),
-              " is not size_n = ", size_n);
-  num_groups = b_scales.size(1);
-
-  torch::Tensor g_idx, perm, a_tmp;
-  ;
-  if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
-    g_idx = g_idx_or_none.value();
-    perm = perm_or_none.value();
-
-    TORCH_CHECK(g_idx.device().is_cuda(), "g_idx is not on GPU");
-    TORCH_CHECK(g_idx.is_contiguous(), "g_idx is not contiguous");
-    TORCH_CHECK(perm.device().is_cuda(), "perm is not on GPU");
-    TORCH_CHECK(perm.is_contiguous(), "perm is not contiguous");
-
-    // Verify g_idx and perm
-    TORCH_CHECK((g_idx.size(-1) == 0 && perm.size(-1) == 0) ||
-                    (g_idx.size(-1) == size_k && perm.size(-1) == size_k),
-                "Unexpected g_idx.size(-1) = ", g_idx.size(-1),
-                " and perm.size(-1) = ", perm.size(-1),
-                ", where size_k = ", size_k);
-  } else {
-    g_idx = torch::empty({0}, options);
-    perm = torch::empty({0}, options);
-    a_tmp = torch::empty({0}, options);
-  }
-  bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
-
-  if (has_act_order) {
-    a_tmp = torch::empty({size_m * top_k, size_k}, options);
-    if (is_k_full) {
-      TORCH_CHECK(num_groups > 1, "For act_order, num_groups must be > 1");
-      TORCH_CHECK(size_k % num_groups == 0, "size_k = ", size_k,
-                  ", is not divisible by num_groups = ", num_groups);
-      group_size = size_k / num_groups;
-    } else {
-      group_size = 0;
-    }
-
-  } else {
-    a_tmp = torch::empty({0}, options);
-    if (num_groups > 1) {
-      TORCH_CHECK(
-          size_k % num_groups == 0, "size_k = ", size_k,
-          ", is not divisible by b_scales.size(1) = ", b_scales.size(1));
-      group_size = size_k / num_groups;
-    } else {
-      group_size = -1;
-    }
-  }
 
   // Verify workspace size
-  TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
-              "size_n = ", size_n, ", is not divisible by min_thread_n = ",
-              MARLIN_NAMESPACE_NAME::min_thread_n);
+  TORCH_CHECK(prob_n % min_thread_n == 0,
+              "prob_n = ", prob_n, ", is not divisible by min_thread_n = ",
+              min_thread_n);
 
-  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+  int max_n_tiles = prob_n / min_thread_n;
   int min_workspace_size =
       min(max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms);
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
@@ -513,13 +474,31 @@ torch::Tensor moe_w4a8_marlin_gemm(
               " is below min_workspace_size = ", min_workspace_size);
 
   int dev = a.get_device();
-  marlin_qqq_cuda(
-      a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), d.data_ptr(),
-      s_tok.data_ptr(), s_ch.data_ptr(), s_group.data_ptr(), size_m, size_n,
-      size_k, workspace.data_ptr(), groupsize, dev,
-      at::cuda::getCurrentCUDAStream(dev), thread_k, thread_n, sms, max_par);
 
-  return c;
+  marlin_w4a8_mm(
+    a.data_ptr(),
+    b.data_ptr(),
+    c_tmp.data_ptr(),
+    d.data_ptr(),
+    s1.data_ptr(),
+    s2.data_ptr(),
+    s3.data_ptr(),
+    sorted_token_ids.data_ptr(),
+    expert_ids.data_ptr(), 
+    num_tokens_past_padded.data_ptr(),
+    topk_weights.data_ptr(), 
+    moe_block_size, top_k, mul_topk_weights, is_ep,
+    prob_m, prob_n, prob_k,
+    workspace.data_ptr(),
+    groupsize,
+    dev,
+    at::cuda::getCurrentCUDAStream(dev),
+    thread_k,
+    thread_n,
+    sms,
+  );
+
+  return d;
 }
 
 #endif
