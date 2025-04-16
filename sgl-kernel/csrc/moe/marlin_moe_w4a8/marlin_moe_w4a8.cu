@@ -23,7 +23,7 @@
 #define MARLIN_W4A8_NAMESPACE_NAME marlin_moe_w4a8
 #endif
 
-#include "core/scalar_type.hpp"
+// #include "core/scalar_type.hpp"
 #include "marlin_w4a8_dtypes.cuh"
 
 
