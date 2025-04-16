@@ -20,10 +20,10 @@
  */
 
 #ifndef MARLIN_W4A8_NAMESPACE_NAME
-#define MARLIN_W4A8_NAMESPACE_NAME marlin_moe_w4a8
+  #define MARLIN_W4A8_NAMESPACE_NAME marlin_moe_w4a8
 #endif
 
-// #include "core/scalar_type.hpp"
+#include "scalar_type.hpp"
 #include "marlin_w4a8_dtypes.cuh"
 
 
@@ -40,7 +40,7 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
          const int thread_k_blocks,  // same for k dimension (reduction)
          const int stages,  // number of stages for the async global->shared
                             // fetch pipeline
-         const int group_blocks,    // number of consecutive 16x16 blocks
+         const int group_blocks     // number of consecutive 16x16 blocks
                                     // with a separate quantization scale
          >
 __global__ void Marlin(

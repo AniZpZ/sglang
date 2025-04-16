@@ -19,18 +19,37 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
- #ifndef MARLIN_W4A8_NAMESPACE_NAME
+#ifndef MARLIN_W4A8_NAMESPACE_NAME
  #define MARLIN_W4A8_NAMESPACE_NAME marlin_moe_w4a8
 #endif
 
-// #include "kernel.h"
-#include "core/registration.h"
 #include "marlin_w4a8_dtypes.cuh"
+#include "marlin_moe_w4a8.cuh"
+// #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
  static_assert(std::is_same<scalar_t, half>::value ||          \
                    std::is_same<scalar_t, nv_bfloat16>::value, \
                "only float16 and bfloat16 is supported");
+
+// Marlin params
+
+// 8 warps are a good choice since every SM has 4 schedulers and having more
+// than 1 warp per schedule allows some more latency hiding. At the same time,
+// we want relatively few warps to have many registers per warp and small tiles.
+const int USER_THREADS = 256; // Note: This is only used with user-provided thread_k/n
+const int pipe_stages = 4; // 4 pipeline stages fit into shared memory
+// const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6 (< 8.0)
+
+static constexpr int min_thread_n = 64;
+static constexpr int min_thread_k = 64;
+static constexpr int max_thread_n = 256;
+
+static constexpr int tile_size = 16;
+static constexpr int max_par = 16;
+
+static constexpr int pack_factor_4bit =
+    8;  // We have 8 4-bit vals inside a 32 bit
 
 namespace MARLIN_W4A8_NAMESPACE_NAME {
 
@@ -332,10 +351,10 @@ void marlin_w4a8_mm(
   int* locks = (int*) workspace;
 
   if (false) {}
-    CALL_IF(8, 8, 256)
-    CALL_IF(16, 4, 256)
-    CALL_IF(8, 4, 128)
-    CALL_IF(4, 8, 128)
+  CALL_IF(8, 8, 256)
+  CALL_IF(16, 4, 256)
+  CALL_IF(8, 4, 128)
+  CALL_IF(4, 8, 128)
   else {
     TORCH_CHECK(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
                 ", ", prob_k, "]",  ", group_size = ", group_size,
@@ -476,7 +495,7 @@ torch::Tensor moe_w4a8_marlin_gemm(
 
   int dev = a.get_device();
 
-  marlin_w4a8_mm(
+  MARLIN_W4A8_NAMESPACE_NAME::marlin_w4a8_mm(
     a.data_ptr(),
     b_q_weight.data_ptr(),
     c_tmp.data_ptr(),
