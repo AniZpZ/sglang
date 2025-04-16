@@ -224,8 +224,7 @@ __device__ inline void wait_negative_and_add(int* lock) {
 }
 
 
-template <typename scalar_t,  // compute dtype, half or nv_float16
-          const int threads,          // number of threads in a threadblock
+template <const int threads,          // number of threads in a threadblock
           const int thread_m_blocks,  // number of 16x16 blocks in the m
                                       // dimension (batchsize) of the
                                       // threadblock
@@ -233,8 +232,7 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
           const int thread_k_blocks,  // same for k dimension (reduction)
           const int stages,  // number of stages for the async global->shared
                              // fetch pipeline
-          const int group_blocks,    // number of consecutive 16x16 blocks
-                                     // with a separate quantization scale
+          const int group_blocks    // number of consecutive 16x16 blocks with a separate quantization scale
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // int8 input matrix of shape mxk 
@@ -255,9 +253,7 @@ __global__ void Marlin(
     int prob_m,             // batch dimension m
     int prob_n,             // output dimension n
     int prob_k,             // reduction dimension k
-    int* locks,             // extra global storage for barrier synchronization
-    bool use_atomic_add,    // whether to use atomic add to reduce
-    bool use_fp32_reduce    // whether to use fp32 global reduce
+    int* locks             // extra global storage for barrier synchronization
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -271,13 +267,15 @@ __global__ void Marlin(
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
 
+  bool use_atomic_add = false;
   // 4bit weight
-  constexpr int pack_factor = 32 / 4;  
+  constexpr int pack_factor = 8;  
   constexpr int moe_block_size = 16 * thread_m_blocks;
-
+  const int group_size =
+      (group_blocks == -1) ? prob_k : prob_k / num_groups;
   // const int scales_expert_stride = prob_n * prob_k / group_size / 8;
   // hongbo: check this
-  const int s2_expert_stride = prob_n * prob_k / group_size / 8; // 每个 expert 的 scale 偏移
+  const int s2_expert_stride = prob_n / 8; // 每个 expert 的 scale 偏移
   const int s3_expert_stride = prob_n / 4; // 每个 expert 的列方向 s2 scale 偏移（int4，每个含4个float）
 
   // parallel: num valid moe blocks
@@ -319,7 +317,7 @@ __global__ void Marlin(
   int par_id = 0;
   int block_id = -1;
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
-  int64_t old_expert_id = 0;
+  int old_expert_id = 0;
   int64_t B_expert_off = 0;
 
   float block_topk_weights[moe_block_size];
@@ -547,16 +545,6 @@ __global__ void Marlin(
   int b_sh_wr = threadIdx.x;
   int b_sh_rd = threadIdx.x;
 
-
-  // hongbosherlcok: don't need this
-  // Precompute which thread should not read memory in which iterations; this is needed if there are more threads than
-  // required for a certain tilesize or when the batchsize is not a multiple of 16.
-  bool a_sh_wr_pred[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
-
-
   // To ensure that writing and reading A tiles to/from shared memory, the
   // latter in fragment format, is fully bank conflict free, we need to use a
   // rather fancy XOR-based layout. The key here is that neither reads nor
@@ -613,7 +601,7 @@ __global__ void Marlin(
   FragS_CHANNEL frag_s2[2][4];
 
   // hongbosherlock: optinal values
-  FragS frag_s[2][4];                    // No act-order
+  // FragS frag_s[2][4];                    // No act-order
 //   FragS act_frag_s[2][4][4];             // For act-order
 //   int frag_qzp[2][num_ints_per_thread];  // Zero-points
 //   FragZP frag_zp;                        // Zero-points in fp16
@@ -628,43 +616,10 @@ __global__ void Marlin(
       reinterpret_cast<float*>(frag_c)[i] = 0;
   };
 
-  int sh_first_group_id = -1;
-  int sh_num_groups = -1;
-  constexpr int sh_max_num_groups = 32;
+  // int sh_first_group_id = -1;
+  // int sh_num_groups = -1;
+  // constexpr int sh_max_num_groups = 32;
 
-  auto fetch_scales_to_shared = [&](bool is_async, int first_group_id,
-                                    int last_group_id) {
-    sh_first_group_id = first_group_id;
-    sh_num_groups = last_group_id - first_group_id + 1;
-
-    if (sh_num_groups < sh_max_num_groups) {
-      sh_num_groups = sh_max_num_groups;
-    }
-
-    if (sh_first_group_id + sh_num_groups > num_groups) {
-      sh_num_groups = num_groups - sh_first_group_id;
-    }
-
-    int row_offset = first_group_id * s_gl_stride;
-
-    if (is_async) {
-      for (int i = 0; i < sh_num_groups; i++) {
-        if (threadIdx.x < s_sh_stride) {
-          cp_async4_pred(&sh_s[(i * s_sh_stride) + threadIdx.x],
-                         &scales_ptr[row_offset + (i * s_gl_stride) +
-                                     slice_n_offset + threadIdx.x]);
-        }
-      }
-    } else {
-      for (int i = 0; i < sh_num_groups; i++) {
-        if (threadIdx.x < s_sh_stride) {
-          sh_s[(i * s_sh_stride) + threadIdx.x] =
-              scales_ptr[row_offset + (i * s_gl_stride) + slice_n_offset +
-                         threadIdx.x];
-        }
-      }
-    }
-  };
 
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
@@ -683,8 +638,8 @@ __global__ void Marlin(
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < b_sh_wr_iters; i++) {
-        cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
-                    B_ptr[i] + j + B_expert_off);
+        cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr],
+                    B_ptr[i] + B_expert_off);
         B_ptr[i] += b_gl_rd_delta_o;
       }
 
@@ -731,7 +686,7 @@ __global__ void Marlin(
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe) {
     
-    // hongbosherlock: how to load scale
+    // hongbosherlock: how to load weight scale
     // It may seem inefficient that we reload the groups for every sub-tile; however, this does not seem to be a
     // significant bottleneck, while some theoretically better attempts have lead to bad instruction ordering by the
     // compiler and correspondingly a noticable drop in performance.
@@ -748,43 +703,6 @@ __global__ void Marlin(
     frag_b_quant[k % 2] = *reinterpret_cast<I4*>(&sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd]);
   };
 
-
-  auto fetch_scales_to_registers = [&](int k, int full_pipe) {
-    int pipe = full_pipe % stages;
-
-    if constexpr (!has_act_order) {
-      // No act-order case
-      if constexpr (group_blocks != -1) {
-        if constexpr (group_blocks >= thread_k_blocks) {
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-          reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
-        } else {
-          int warp_id = threadIdx.x / 32;
-          int n_warps = thread_n_blocks / 4;
-
-          int warp_row = warp_id / n_warps;
-
-          int cur_k = warp_row * 16;
-          cur_k += k_iter_size * (k % b_sh_wr_iters);
-
-          int k_blocks = cur_k / 16;
-          int cur_group_id = k_blocks / group_blocks;
-
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-
-          reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
-              sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
-        }
-      }
-
-      return;
-    }
-
-    // Act-order case
-  };
-
-  // hongbosherlock: optional
-  // auto fetch_zp_to_registers 
 
   // Execute the actual tensor core matmul of a sub-tile. 
   auto matmul = [&] (int k) {
@@ -937,13 +855,30 @@ __global__ void Marlin(
                             reinterpret_cast<int*>(&d2)[j] = 
                                 reinterpret_cast<int*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * (j + 4) + (i % 4)];
                         }
-                    int c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
-                    int64_t sorted_row = block_sorted_ids[c_idx / c_gl_stride];
-                    int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
-                    if (c_idx / c_gl_stride < block_num_valid_tokens) C[true_idx] = d1;
-                    // hongbo: why d1 and d2
-                        // C[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)] = d1;
-                        // C[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2) + 1] = d2;
+
+                    // int c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
+                    // int64_t sorted_row = block_sorted_ids[c_idx / c_gl_stride];
+                    // int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
+                    // if (c_idx / c_gl_stride < block_num_valid_tokens) C[true_idx] = d1;
+                      
+                      // 计算基础索引
+                      int c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
+                      
+                      // 计算排序后的行索引和真实索引
+                      int64_t original_row = c_idx / c_gl_stride;
+                      if (original_row < block_num_valid_tokens) {
+                          int64_t sorted_row = block_sorted_ids[original_row];
+                          
+                          // 计算d1的写入位置
+                          int64_t true_idx_d1 = sorted_row * c_gl_stride + c_idx % c_gl_stride;
+                          C[true_idx_d1] = d1;
+                          
+                          // 检查列边界有效性
+                          if ((c_idx % c_gl_stride) + 1 < c_gl_stride) {
+                              C[true_idx_d1 + 1] = d2;
+                          } 
+                      }
+
                     }
                 }
             }
@@ -999,7 +934,7 @@ __global__ void Marlin(
       half2 topk_weight_score = __float2half2_rn(block_topk_weights[row]);
       if (row < block_num_valid_tokens) {
           if ((use_atomic_add && slice_count > 1) || mul_topk_weights) {
-            half2* C_half2 = reinterpret_cast<half2*>(&C[true_idx]);
+            half2* D_half2 = reinterpret_cast<half2*>(&D[true_idx]);
             half2* sh_red_half2 = reinterpret_cast<half2*>(&sh[d_sh_rd]);
     #pragma unroll
             for (int a = 0; a < 4; a++) {
@@ -1008,9 +943,9 @@ __global__ void Marlin(
                   res = __hmul2(res, topk_weight_score);
                 } 
                 if (use_atomic_add && slice_count > 1) {
-                        atomicAdd(&C_half2[a], res);
+                        atomicAdd(&D_half2[a], res);
                     } else {
-                        C_half2[a] = res;
+                        D_half2[a] = res;
                       }
                     }
                 } else {
