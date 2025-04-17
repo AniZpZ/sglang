@@ -58,15 +58,32 @@ namespace MARLIN_W4A8_NAMESPACE_NAME {
 
 }  // namespace marlin
 
-torch::Tensor moe_w4a8_marlin_gemm(
-  const torch::Tensor& a, const torch::Tensor& b_q_weight, std::optional<torch::Tensor> const& d_or_none,
-  const torch::Tensor& s1, const torch::Tensor& s2,
-  const torch::Tensor& s3, torch::Tensor& sorted_token_ids,           //moe
-  torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
-  torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-  bool is_ep, torch::Tensor& workspace,
-  int64_t prob_m, int64_t prob_n, int64_t prob_k
-) {
+torch::Tensor torch::Tensor moe_w4a8_marlin_gemm(
+  const torch::Tensor& a,
+  const torch::Tensor& a_scale,
+  std::optional<torch::Tensor> const& d_or_none,
+  const torch::Tensor& b_q_weight,
+  const torch::Tensor& b_scale1,
+  const torch::Tensor& b_scale2,
+  std::optional<torch::Tensor> const& b_zeros_or_none,
+  std::optional<torch::Tensor> const& g_idx_or_none,
+  std::optional<torch::Tensor> const& perm_or_none, 
+  torch::Tensor& workspace,
+  torch::Tensor& sorted_token_ids,           //moe
+  torch::Tensor& expert_ids,
+  torch::Tensor& num_tokens_past_padded,
+  torch::Tensor& topk_weights,
+  int64_t moe_block_size, 
+  int64_t top_k,
+  bool mul_topk_weights,
+  bool is_ep,                                //moe
+  int64_t prob_m,
+  int64_t prob_n,
+  int64_t prob_k,
+  bool is_k_full, 
+  bool use_atomic_add, 
+  bool use_fp32_reduce,
+  bool is_zp_float) {
  TORCH_CHECK_NOT_IMPLEMENTED(false,
                              "moe_w4a8_marlin_gemm(..) requires CUDA_ARCH >= 8.0");
  return torch::empty({1, 1});
@@ -369,11 +386,15 @@ void marlin_w4a8_mm(
 
 torch::Tensor moe_w4a8_marlin_gemm(
   const torch::Tensor& a,
-  const torch::Tensor& b_q_weight,
-  std::optional<torch::Tensor> const& d_or_none,
   const torch::Tensor& s1,
+  std::optional<torch::Tensor> const& d_or_none,
+  const torch::Tensor& b_q_weight,
   const torch::Tensor& s2,
   const torch::Tensor& s3,
+  std::optional<torch::Tensor> const& b_zeros_or_none,
+  std::optional<torch::Tensor> const& g_idx_or_none,
+  std::optional<torch::Tensor> const& perm_or_none, 
+  torch::Tensor& workspace,
   torch::Tensor& sorted_token_ids,           //moe
   torch::Tensor& expert_ids,
   torch::Tensor& num_tokens_past_padded,
@@ -382,10 +403,13 @@ torch::Tensor moe_w4a8_marlin_gemm(
   int64_t top_k,
   bool mul_topk_weights,
   bool is_ep,                                //moe
-  torch::Tensor& workspace,
   int64_t prob_m,
   int64_t prob_n,
-  int64_t prob_k
+  int64_t prob_k,
+  bool is_k_full, 
+  bool use_atomic_add, 
+  bool use_fp32_reduce,
+  bool is_zp_float
 ) {
 
   // int pack_factor = 32 / 4;
