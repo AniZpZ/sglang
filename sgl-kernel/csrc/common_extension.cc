@@ -222,7 +222,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
   m.def(
       "moe_w4a8_marlin_gemm(Tensor! a, Tensor! s1, Tensor? d_or_none, "
-      "Tensor! b_q_weight, Tensor! s2, Tensor? s3, Tensor? b_zeros_or_none, "
+      "Tensor! b_q_weight, Tensor! s2, Tensor! s3, Tensor? b_zeros_or_none, "
       "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace, "
       "Tensor sorted_token_ids, "
       "Tensor! expert_ids, Tensor! num_tokens_past_padded, "

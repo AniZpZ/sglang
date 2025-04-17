@@ -312,11 +312,11 @@ torch::Tensor moe_wna16_marlin_gemm(
 
 torch::Tensor moe_w4a8_marlin_gemm(
   const torch::Tensor& a,
-  const torch::Tensor& a_scale,
+  const torch::Tensor& s1,
   std::optional<torch::Tensor> const& d_or_none,
   const torch::Tensor& b_q_weight,
-  const torch::Tensor& b_scale1,
-  const torch::Tensor& b_scale2,
+  const torch::Tensor& s2,
+  const torch::Tensor& s3,
   std::optional<torch::Tensor> const& b_zeros_or_none,
   std::optional<torch::Tensor> const& g_idx_or_none,
   std::optional<torch::Tensor> const& perm_or_none, 
