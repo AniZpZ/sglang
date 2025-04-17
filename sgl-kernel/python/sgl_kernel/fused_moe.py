@@ -332,8 +332,8 @@ def fused_marlin_w4a8_moe(
         2 * N,  # size_n
         K,  # size_k
         is_k_full,  # is_k_full
-        True,  # use_atomic_add
-        True,  # use_fp32_reduce
+        False,  # use_atomic_add
+        False,  # use_fp32_reduce
         False,  # is_zp_float
     )
 
@@ -363,8 +363,8 @@ def fused_marlin_w4a8_moe(
         size_n=K,
         size_k=N,
         is_full_k=is_k_full,
-        use_atomic_add=True,
-        use_fp32_reduce=True,
+        use_atomic_add=False,
+        use_fp32_reduce=False,
         is_zp_float=False,
     ).view(-1, topk, K)
 

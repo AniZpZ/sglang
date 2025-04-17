@@ -58,7 +58,7 @@ namespace MARLIN_W4A8_NAMESPACE_NAME {
 
 }  // namespace marlin
 
-torch::Tensor torch::Tensor moe_w4a8_marlin_gemm(
+torch::Tensor moe_w4a8_marlin_gemm(
   const torch::Tensor& a,
   const torch::Tensor& a_scale,
   std::optional<torch::Tensor> const& d_or_none,

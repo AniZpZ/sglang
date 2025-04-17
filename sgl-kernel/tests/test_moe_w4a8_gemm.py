@@ -8,8 +8,6 @@ import torch
 from typing import Optional
 import functools
 
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
-
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     fused_topk, moe_align_block_size, try_get_optimal_moe_config)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test_qqq import (  # noqa: E501
@@ -188,30 +186,34 @@ def single_marlin_moe(
     )
 
     moe_w4a8_marlin_gemm(hidden_states,
-                        w,
-                        intermediate_cache,
                         s_tok,
+                        intermediate_cache,
+                        w,
                         s_ch,
                         s_group,
-                        sorted_token_ids,
-                        expert_ids,
-                        num_tokens_post_padded,
-                        topk_weights,
+                        workspace=workspace,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=expert_ids,
+                        num_tokens_past_padded=num_tokens_post_padded,
+                        topk_weights=topk_weights,
                         moe_block_size=block_size_m,
                         top_k=topk,
                         mul_topk_weights=False,
                         is_ep=expert_map is not None,
-                        workspace=workspace,
                         prob_m=M,
                         prob_n=N,
-                        prob_k=K)
+                        prob_k=K,
+                        is_k_full=False,
+                        use_atomic_add=False,
+                        use_fp32_reduce=False,
+                        is_zp_float=False)
     intermediate_cache = intermediate_cache.view(-1, topk, N)
 
     return torch.sum(intermediate_cache.view(*intermediate_cache.shape), dim=1)
 
 
 if __name__ == '__main__':
-    m,m,k = 64,1024,2048
+    m,n,k = 64,1024,2048
     e = 64
     topk = 8
     dtype = torch.float16
