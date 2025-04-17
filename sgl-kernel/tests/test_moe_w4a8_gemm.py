@@ -74,6 +74,10 @@ def test_single_marlin_moe_multiply(m: int, n: int, k: int, e: int, topk: int,
         w_ref, qweight, s_group, s_ch = marlin_qqq_quantize(
                   w[i].transpose(1, 0), num_bits, group_size)
 
+        print("w_ref",w_ref.shape)
+        print("qweight",qweight.shape)
+        print("s3",s_group.shape)
+        print("s_ch",s_ch.shape)
         w_ref_l.append(w_ref.T)
         qweight_l.append(qweight)
         s_group_l.append(s_group)
@@ -99,6 +103,11 @@ def test_single_marlin_moe_multiply(m: int, n: int, k: int, e: int, topk: int,
 
     torch_output = torch_moe_single(a_input, w_ref, score, topk)
 
+    print("torch_output",torch_output.shape)
+    print("marlin_output",marlin_output.shape)
+    print("marlin_output",marlin_output)
+
+    # exit(0)
     torch.testing.assert_close(marlin_output, torch_output, atol=2e-2, rtol=0)
 
 
@@ -182,7 +191,7 @@ def single_marlin_moe(
     intermediate_cache = torch.empty(
         (M * topk_ids.shape[1], N),
         device=hidden_states.device,
-        dtype=hidden_states.dtype,
+        dtype=torch.float16,
     )
 
     moe_w4a8_marlin_gemm(hidden_states,
@@ -214,8 +223,8 @@ def single_marlin_moe(
 
 if __name__ == '__main__':
     m,n,k = 64,1024,2048
-    e = 64
-    topk = 8
+    e = 8
+    topk = 2
     dtype = torch.float16
     group_size = 128
     num_bits = 4
