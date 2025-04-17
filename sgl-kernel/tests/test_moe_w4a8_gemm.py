@@ -5,6 +5,8 @@ Run `pytest tests/kernels/test_moe.py`.
 """
 import pytest
 import torch
+from typing import Optional
+import functools
 
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 
@@ -59,9 +61,9 @@ def test_single_marlin_moe_multiply(m: int, n: int, k: int, e: int, topk: int,
     w = torch.randn((e, n, k), device="cuda", dtype=dtype) / 10
 
     # Quantize activations
-    s_a = a_input.abs().max(dim=-1, keepdim=True)[0].div(int8_traits.max).to(
+    s_tok = a_input.abs().max(dim=-1, keepdim=True)[0].div(int8_traits.max).to(
         torch.float)
-    q_a = (a_input / s_a).round().clamp(int8_traits.min,
+    q_a = (a_input / s_tok).round().clamp(int8_traits.min,
                                         int8_traits.max).to(torch.int8)
 
     # Quantize weights
@@ -78,8 +80,6 @@ def test_single_marlin_moe_multiply(m: int, n: int, k: int, e: int, topk: int,
         qweight_l.append(qweight)
         s_group_l.append(s_group)
         s_ch_l.append(s_ch)
-        zeros_l.append(zeros)
-
 
     w_ref = stack_and_dev(w_ref_l)
     qweight = stack_and_dev(qweight_l).contiguous()
@@ -88,7 +88,7 @@ def test_single_marlin_moe_multiply(m: int, n: int, k: int, e: int, topk: int,
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
     marlin_output = single_marlin_moe(
-        a,
+        q_a,
         qweight,
         s_tok,
         s_ch,
@@ -143,7 +143,7 @@ def single_marlin_moe(
     assert gating_output.shape[1] == w.shape[0], "Number of experts mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w.is_contiguous(), "Expert weights must be contiguous"
-    assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    # assert hidden_states.dtype in [torch.float16, torch.bfloat16]
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
