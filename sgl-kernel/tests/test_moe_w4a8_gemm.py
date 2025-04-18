@@ -194,12 +194,15 @@ def single_marlin_moe(
         dtype=torch.float16,
     )
 
-    torch.ops.sgl_kernel.moe_wna16_marlin_gemm(hidden_states,
+    torch.ops.sgl_kernel.moe_w4a8_marlin_gemm(hidden_states,
                         s_tok,
                         intermediate_cache,
                         w,
                         s_ch,
                         s_group,
+                        None,
+                        None,
+                        None,
                         workspace=workspace,
                         sorted_token_ids=sorted_token_ids,
                         expert_ids=expert_ids,
@@ -222,7 +225,7 @@ def single_marlin_moe(
 
 
 if __name__ == '__main__':
-    m,n,k = 64,1024,2048
+    m,n,k = 64,1024,1024
     e = 8
     topk = 2
     dtype = torch.float16

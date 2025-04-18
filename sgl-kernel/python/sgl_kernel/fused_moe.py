@@ -11,6 +11,11 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.scalar_type import scalar_types
 from vllm.utils import direct_register_custom_op
 
+# from sglang.srt.layers.quantization.int8_kernel import (
+#     per_token_group_quant_int8,
+#     per_token_quant_int8,
+# )
+
 
 def get_scalar_type(num_bits: int, has_zp: bool):
     if has_zp:

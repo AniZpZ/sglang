@@ -3,7 +3,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-from sgl_kernel import awq_dequantize
+# from sgl_kernel import awq_dequantize
 
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -185,6 +185,8 @@ class AWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sgl_kernel import awq_dequantize
+        
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros
