@@ -14,7 +14,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_test_qqq import 
     marlin_qqq_quantize)
 
 # from QQQ._CUDA import moe_w4a8_marlin_gemm
-from sgl_kernel import moe_w4a8_marlin_gemm
+import sgl_kernel
 
 
 NUM_EXPERTS = [8, 64]
@@ -194,7 +194,7 @@ def single_marlin_moe(
         dtype=torch.float16,
     )
 
-    moe_w4a8_marlin_gemm(hidden_states,
+    torch.ops.sgl_kernel.moe_wna16_marlin_gemm(hidden_states,
                         s_tok,
                         intermediate_cache,
                         w,
@@ -228,4 +228,4 @@ if __name__ == '__main__':
     dtype = torch.float16
     group_size = 128
     num_bits = 4
-    test_single_marlin_moe_multiply(m,n,k,e,topk,dtype,group_size,num_bits)
+    test_single_marlin_moe_multiply(m, n, k, e, topk, dtype, group_size, num_bits)

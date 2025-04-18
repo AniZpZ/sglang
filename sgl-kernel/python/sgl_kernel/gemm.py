@@ -197,3 +197,38 @@ def scaled_fp4_quant(
     )
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
+
+# def w4a8_moe_gemm(
+#     a: torch.Tensor,
+#     s1: torch.Tensor,
+#     d_or_none: Optional[torch.Tensor],
+#     b_q_weight: torch.Tensor,
+#     s2: torch.Tensor,
+#     s3: torch.Tensor,
+#     b_zeros_or_none: Optional[torch.Tensor],
+#     g_idx_or_none: Optional[torch.Tensor],
+#     perm_or_none: Optional[torch.Tensor], 
+#     workspace: torch.Tensor,
+#     sorted_token_ids: torch.Tensor,
+#     expert_ids: torch.Tensor,
+#     num_tokens_past_padded: torch.Tensor,
+#     topk_weights: torch.Tensor,
+#     moe_block_size: int , 
+#     top_k: int,
+#     mul_topk_weights: bool,
+#     is_ep: bool,
+#     prob_m: int,
+#     prob_n: int,
+#     prob_k: int,
+#     is_k_full: bool, 
+#     use_atomic_add: bool, 
+#     use_fp32_reduce: bool,
+#     is_zp_float: bool  
+# ) -> torch.Tensor:
+#     out = torch.empty(
+#         (prob_m * topk_ids.shape[1], prob_n),
+#         device=hidden_states.device,
+#         dtype=torch.float16,
+#     )
+
+#     return out
