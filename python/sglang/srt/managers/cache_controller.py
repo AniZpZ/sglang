@@ -185,24 +185,24 @@ class HiCacheController:
         self.write_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
 
-        self.write_thread = threading.Thread(
-            target=(
-                self.write_thread_func_buffer
-                if self.page_size == 1
-                else self.write_thread_func_direct
-            ),
-            daemon=True,
-        )
-        self.load_thread = threading.Thread(
-            target=self.load_thread_func_layer_by_layer, daemon=True
-        )
-        self.write_thread.start()
-        self.load_thread.start()
+        # self.write_thread = threading.Thread(
+        #     target=(
+        #         self.write_thread_func_buffer
+        #         if self.page_size == 1
+        #         else self.write_thread_func_direct
+        #     ),
+        #     daemon=True,
+        # )
+        # self.load_thread = threading.Thread(
+        #     target=self.load_thread_func_layer_by_layer, daemon=True
+        # )
+        # self.write_thread.start()
+        # self.load_thread.start()
 
     def reset(self):
         self.stop_event.set()
-        self.write_thread.join()
-        self.load_thread.join()
+        # self.write_thread.join()
+        # self.load_thread.join()
 
         self.write_queue.queue.clear()
         self.load_queue.queue.clear()
