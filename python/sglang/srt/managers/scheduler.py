@@ -948,7 +948,32 @@ class Scheduler(
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
         else:
-            self._add_request_to_queue(req)
+            if not self.has_add_request_to_queue(req):
+                self._add_request_to_queue(req)
+
+    def has_add_request_to_queue(self, new_req):
+        has_add = False
+        if len(self.streaming_input_prefill_batch) > 0:
+            streaming_input_prefill_batch_temp = []
+            for req in self.streaming_input_prefill_batch:
+                if req.rid == new_req.rid:
+                    streaming_input_prefill_batch_temp.append(new_req)
+                    has_add = True
+                else:
+                    streaming_input_prefill_batch_temp.append(req)
+            self.streaming_input_prefill_batch = streaming_input_prefill_batch_temp
+
+        if len(self.waiting_queue) > 0:
+            waiting_queue_temp = []
+            for req in self.waiting_queue:
+                if req.rid == new_req.rid:
+                    has_add = True
+                    waiting_queue_temp.append(new_req)
+                else:
+                    waiting_queue_temp.append(req)
+            self.waiting_queue = waiting_queue_temp
+
+        return has_add
 
     def _add_request_to_queue(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

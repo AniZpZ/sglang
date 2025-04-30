@@ -1342,7 +1342,7 @@ async def v1_chat_completions(
         request_json = raw_request
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, request_ids=request_json['request_id'])
 
     if adapted_request.stream:
         parser_dict = {}

@@ -349,11 +349,12 @@ class TokenizerManager:
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
-        tokenized_obj = self._tokenize_one_request(obj)
+        async with self.model_update_lock.reader_lock:
+            tokenized_obj = self._tokenize_one_request(obj)
 
-        tokenized_obj.streaming_input = request['streaming_input']
-        tokenized_obj.commit = request['commit']
-        self._send_one_request(obj, tokenized_obj, created_time)
+            tokenized_obj.streaming_input = request['streaming_input']
+            tokenized_obj.commit = request['commit']
+            self._send_one_request(obj, tokenized_obj, created_time, skip_state=True)
 
 
 
@@ -503,9 +504,11 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
+        skip_state: Optional[bool] = None,
     ):
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
-        self.rid_to_state[obj.rid] = state
+        if skip_state:
+            state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+            self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(

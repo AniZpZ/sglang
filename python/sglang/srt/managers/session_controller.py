@@ -110,7 +110,7 @@ class Session:
 
             last_req.origin_input_ids = input_ids
             last_req.origin_input_ids_unpadded = input_ids_unpadded
-
+        last_req.tokenizer = tokenizer
         last_req.last_add_time = time.time()
         last_req.commit = req_input.commit
         return last_req

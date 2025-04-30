@@ -498,7 +498,7 @@ class SchedulerOutputProcessorMixin:
             ) = None
 
         for req in reqs:
-            if req in skip_req_list:
+            if skip_req_list is not None and  req in skip_req_list:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
