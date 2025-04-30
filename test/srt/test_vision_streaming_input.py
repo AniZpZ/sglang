@@ -15,7 +15,7 @@ from PIL import Image
 from io import BytesIO
 import base64
 
-video_path = '/path/to/video_file'
+video_path = 'demo_video_park.mp4'
 
 def image_to_base64(image: Image.Image, fmt='png') -> str:
     output_buffer = BytesIO()
@@ -54,13 +54,16 @@ def get_video_chunk_content(video_path, flatten=True):
 
 multi_modal_contents = get_video_chunk_content(video_path)
 
+pack_num = len(multi_modal_contents)
+index = 0
 
 
 async def ws_client(url):
     async with websockets.connect(url, max_size=2**22, read_limit=2**22, write_limit=2**22) as websocket:
         # open session package
+        session_id =str(uuid.uuid1())
 
-        json_map = {"capacity_of_str_len": 1000, "session_id": (str(uuid.uuid1()))}
+        json_map = {"capacity_of_str_len": 1000, "session_id": session_id}
         print(json_map)
         json_str =json.dumps(json_map)
         await websocket.send(json_str)
@@ -78,15 +81,19 @@ async def ws_client(url):
             }],
             "max_completion_tokens": 200,
             "temperature":0.0,
-            "model": "/home/admin/openbmb__MiniCPM-o-2_6"
+            "model": "/home/admin/openbmb__MiniCPM-o-2_6",
+            "commit": False
         }
         await websocket.send(json.dumps(prompt_package))
 
         # multimodal package
         for image, audio in multi_modal_contents:
             image_base64 = image_to_base64(image)
-            audio_base64 = audio_to_base64(audio)
-
+            # audio_base64 = audio_to_base64(audio)
+            # image_base64 = "video"
+            # audio_base64 = "audio"
+            global index
+            index += 1
 
             multi_modal_package = {
                 "messages":[{
@@ -98,26 +105,27 @@ async def ws_client(url):
                                 "url": image_base64
                             },
                         },
-                        {
-                            "type": "audio_url",
-                            "audio_url": {
-                                "url": audio_base64
-                            },
-                        },
+                        # {
+                        #     "type": "audio_url",
+                        #     "audio_url": {
+                        #         "url": audio_base64
+                        #     },
+                        # },
                     ],
                 }],
                 "max_completion_tokens": 200,
                 "temperature":0.0,
-                "model": "/home/admin/openbmb__MiniCPM-o-2_6"
+                "model": "/home/admin/openbmb__MiniCPM-o-2_6",
+                "commit": True if index==pack_num-1 else False
             }
 
             await websocket.send(json.dumps(multi_modal_package))
-            time.sleep(1)
+            time.sleep(2)
 
 
         response = await websocket.recv()
         print(response)
 
 
-asyncio.run(ws_client('ws://localhost:8188'))
+asyncio.run(ws_client('ws://localhost:8288'))
 
