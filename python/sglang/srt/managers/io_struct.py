@@ -949,3 +949,16 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+@dataclass
+class LoRAModulePath:
+    name: str
+    local_path: str
+
+# adapt from https://code.alipay.com/vllm/ant_vllm/commit/c2b01ad1090741eabb7f8d9d8e4f209a2fff1c83
+@dataclass
+class UpdateLoRARequest:
+    # added new loras
+    add_loras: Optional[List[LoRAModulePath]] = None
+    # deleted loras
+    delete_loras: Optional[List[LoRAModulePath]] = None

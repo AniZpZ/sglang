@@ -596,6 +596,18 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     return ORJSONResponse(content=response_data, status_code=200)
 
 
+# lora hot update
+@app.post("/update_lora")
+async def update_lora(obj: UpdateLoraReq, request: Request):
+    try:
+        async with update_lora_lock:
+            openai_serving_chat.update_loras(update_request)
+            openai_serving_completion.update_loras(update_request)
+        return Response(status_code=200)
+    except RuntimeError as e:
+        return Response(status_code=500, content=f"{e}")
+
+
 ##### OpenAI-compatible API endpoints #####
 
 
