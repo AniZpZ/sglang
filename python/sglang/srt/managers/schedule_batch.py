@@ -39,7 +39,7 @@ import threading
 from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
-
+import time
 import numpy as np
 import torch
 import triton
@@ -626,6 +626,7 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        self.finish_time = None
 
     @property
     def seqlen(self):
@@ -700,17 +701,20 @@ class Req:
             self.finished_reason = FINISH_ABORT(
                 message=self.to_abort_message,
             )
+            self.finish_time = time.time()
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            self.finish_time = time.time()
             return
 
         if self.grammar is not None:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                self.finish_time = time.time()
                 return
 
         last_token_id = self.output_ids[-1]
@@ -731,6 +735,7 @@ class Req:
                     )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+                self.finish_time = time.time()
                 return
 
         # Check stop strings
@@ -742,6 +747,7 @@ class Req:
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    self.finish_time = time.time()
                     return
 
     def reset_for_retract(self):
@@ -799,6 +805,9 @@ class Req:
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
+
+    def __del__(self):
+        print(f"==================del relay time: {time.time() - self.finish_time}")
 
 
 # Batch id
