@@ -213,6 +213,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("awq_marlin_repack", torch::kCUDA, &marlin_moe_wna16::awq_marlin_repack);
 
   /*
+   * From csrc/quantization
+   */ 
+  m.def(
+      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, int bit) -> Tensor");
+  m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+
+  /*
    * From csrc/speculative
    */
   m.def(
