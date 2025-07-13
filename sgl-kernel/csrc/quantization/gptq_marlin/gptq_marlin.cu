@@ -895,5 +895,3 @@ torch::Tensor gptq_marlin_gemm(
 }
 
 #endif
-
-}
