@@ -333,6 +333,21 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64
 }  // namespace marlin_moe_wna16
 
 /*
+ * From csrc/quantization
+ */
+
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight, torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    sglang::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
+    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
+    bool is_zp_float)
+
+/*
  * From csrc/speculative
  */
 void tree_speculative_sampling_target_only(
