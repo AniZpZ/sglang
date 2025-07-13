@@ -24,7 +24,7 @@
 #endif
 
 #include "kernel.h"
-#include "core/registration.h"
+#include "moe/marlin_moe_wna16/core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \

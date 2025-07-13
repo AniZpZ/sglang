@@ -5,7 +5,7 @@
 
 #include "moe/marlin_moe_wna16/gptq_marlin/marlin.cuh"
 #include "moe/marlin_moe_wna16/gptq_marlin/marlin_dtypes.cuh"
-#include "core/scalar_type.hpp"
+#include "scalar_type.hpp"
 
 #define MARLIN_KERNEL_PARAMS                                                   \
   const int4 *__restrict__ A, const int4 *__restrict__ B,                      \
