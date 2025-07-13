@@ -345,7 +345,7 @@ torch::Tensor gptq_marlin_gemm(
     std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     sglang::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float)
+    bool is_zp_float);
 
 /*
  * From csrc/speculative
