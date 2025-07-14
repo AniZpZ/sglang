@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.distributed.communication_op import get_communication_counter
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class HiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.mooncake_l3_kv_pool = None
+        self.communication_counter = None
         self.mooncake_l3_load_cache_event = None
         self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
         self.page_size = page_size
@@ -96,6 +98,7 @@ class HiRadixCache(RadixCache):
             self.mooncake_l3_kv_pool.register_buffer(self.token_to_kv_pool_host.kv_buffer)
             self.mooncake_l3_load_cache_event = threading.Event()
             self.l3_ongoing_load_back = {}
+            self.communication_counter = get_communication_counter()
 
         self.tp_group = tp_cache_group
 
@@ -109,6 +112,7 @@ class HiRadixCache(RadixCache):
             write_policy=hicache_write_policy,
             mooncake_l3_kv_pool=self.mooncake_l3_kv_pool,
             mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event,
+            communication_counter=self.communication_counter
         )
 
         # record the nodes with ongoing write through
@@ -143,7 +147,11 @@ class HiRadixCache(RadixCache):
         l3_keys = []
         if self.enable_mooncake_store_l3_cache:
             # The KV cache of each rank in the MLA model is the same, so only one copy needs to be stored
-            local_rank =  torch.cuda.current_device()
+            local_rank = (
+                0
+                if isinstance(self.kv_cache, MLATokenToKVPool)
+                else torch.cuda.current_device()
+            )
             prefix_block_key = (
                 ""
                 if node.parent is None or len(node.parent.l3_keys) == 0
@@ -405,9 +413,11 @@ class HiRadixCache(RadixCache):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
             return None
-
+        l3_keys_list = []
+        for node in  nodes_to_load:
+            l3_keys_list.extend(node.l3_keys)
         device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
+            host_indices=host_indices, node_id=last_hit_node.id, l3_keys=l3_keys_list
         )
         if device_indices is None:
             self.evict(len(host_indices))
@@ -542,7 +552,11 @@ class HiRadixCache(RadixCache):
         if self.enable_mooncake_store_l3_cache:
             # try to get the cross instance shared kv cache
             if len(key) and (not node.evicted or node.backuped):
-                local_rank =  torch.cuda.current_device()
+                local_rank = (
+                    0
+                    if isinstance(self.kv_cache, MLATokenToKVPool)
+                    else torch.cuda.current_device()
+                )
                 prefix_block_key = (
                     ""
                     if node.parent is None or len(node.parent.l3_keys) == 0

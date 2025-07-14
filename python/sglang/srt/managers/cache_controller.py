@@ -25,7 +25,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
-
+from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -33,8 +33,18 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
+from sglang.srt.distributed.communication_op import get_communication_counter
+
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 logger = logging.getLogger(__name__)
+
+
+def get_fragment_index(key_len, rank):
+    div, rem = divmod(key_len, get_tensor_model_parallel_world_size())
+    sizes = [div + 1] * rem + [div] * (key_len - rem)
+    return sum(sizes[:rank]), sum(sizes[:rank + 1])
 
 
 class LayerDoneCounter:
@@ -254,6 +264,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         mooncake_l3_kv_pool: MooncakeStore = None,
         mooncake_l3_load_cache_event: threading.Event = None,
+        communication_counter=None
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -313,6 +324,11 @@ class HiCacheController:
             self.mooncake_l3_load_cache_event = mooncake_l3_load_cache_event
 
             self.mooncake_l3_ack_load_queue = Queue()
+
+            self.l3_fragment_load = False
+            if isinstance(mem_pool_host, MLATokenToKVPoolHost):
+                self.l3_fragment_load = True
+                self.communication_counter = communication_counter
 
             # L2 -> L3
             self.mooncake_l3_write_thread = threading.Thread(
@@ -403,6 +419,7 @@ class HiCacheController:
         self,
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
+        l3_keys: Optional[List[str]] = None,
         node_id: int = 0,
     ) -> Optional[torch.Tensor]:
         """
@@ -415,7 +432,7 @@ class HiCacheController:
         # to ensure the device indices are ready before accessed by another CUDA stream
         torch.cuda.current_stream().synchronize()
         self.load_queue.put(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, device_indices, node_id, priority, l3_keys=l3_keys)
         )
         return device_indices
 
@@ -486,14 +503,19 @@ class HiCacheController:
             try:
                 operation = self.mooncake_l3_write_queue.get(block=True, timeout=0.001)
                 keys = operation.mooncake_keys
+                host_indices = operation.host_indices.tolist()
+                if self.l3_fragment_load:
+                    start_index, end_index = get_fragment_index(len(keys), get_tensor_model_parallel_rank())
+                    keys = keys[start_index : end_index]
+                    host_indices = host_indices[start_index * self.page_size: end_index * self.page_size]
+
                 mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(keys)
-                indices = operation.host_indices.tolist()
                 non_exist_keys = []
                 non_exist_indices = []
                 for i in range(len(keys)):
                     if not mooncake_exist_keys[keys[i]]:
                         non_exist_keys.append(keys[i])
-                        non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                        non_exist_indices.extend(host_indices[i * self.page_size: (i + 1) * self.page_size])
                 if len(non_exist_keys) > 0:
                     key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
                                                                                      non_exist_indices)
@@ -509,9 +531,16 @@ class HiCacheController:
         while not self.mooncake_l3_stop_event.is_set():
             try:
                 operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
-                key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
-                                                                                 operation.host_indices.tolist())
-                self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
+                mooncake_keys = operation.mooncake_keys
+                host_indices = operation.host_indices.tolist()
+                if self.l3_fragment_load:
+                    start_index, end_index = get_fragment_index(len(mooncake_keys), get_tensor_model_parallel_rank())
+                    mooncake_keys = mooncake_keys[start_index : end_index]
+                    host_indices = host_indices[start_index * self.page_size: end_index * self.page_size]
+                if len(mooncake_keys) > 0:
+                    key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(mooncake_keys,
+                                                                                             host_indices)
+                    self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
 
                 for node_id in operation.node_ids:
                     if node_id != 0:
@@ -549,16 +578,36 @@ class HiCacheController:
             host_indices, device_indices = self.move_indices(
                 batch_operation.host_indices, batch_operation.device_indices
             )
+            host_indices_split = None
+            device_indices_split = None
+            device_indices_pad = None
+            device_indices_split_pad = None
+            if self.l3_fragment_load:
+                start_index, end_index = get_fragment_index(len(batch_operation.l3_keys),
+                                                            get_tensor_model_parallel_rank())
+                host_indices_split = host_indices[start_index * self.page_size:end_index * self.page_size]
+                device_indices_split = device_indices[start_index * self.page_size:end_index * self.page_size]
+                device_indices_pad, device_indices_split_pad = self.mem_pool_device.get_padded_device_indices(
+                    batch_operation.device_indices, device_indices_split)
             for i in range(self.mem_pool_host.layer_num):
                 self.mem_pool_device.load_from_host_per_layer(
                     self.mem_pool_host,
-                    host_indices,
-                    device_indices,
+                    host_indices_split if self.l3_fragment_load else host_indices,
+                    device_indices_split if self.l3_fragment_load else device_indices,
                     i,
                     self.io_backend,
                 )
                 self.load_stream.synchronize()
+                if self.l3_fragment_load:
+                    self.mem_pool_device.mla_kv_cache_all_gather(
+                        i,
+                        device_indices_pad,
+                        device_indices_split_pad
+                    )
                 self.layer_done_counter.increment()
+
+            if self.l3_fragment_load:
+                self.communication_counter.reset()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
             for node_id in batch_operation.node_ids:

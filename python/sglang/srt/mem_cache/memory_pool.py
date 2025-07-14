@@ -44,6 +44,8 @@ from sgl_kernel.kvcacheio import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 logger = logging.getLogger(__name__)
 
@@ -547,6 +549,9 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.world_size = get_tensor_model_parallel_world_size()
+        self.local_rank = get_tensor_model_parallel_rank()
+        self.device = device
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -569,12 +574,15 @@ class MLATokenToKVPool(KVCache):
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = torch.zeros(
-                    (layer_num, size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                    (layer_num, size + page_size + (self.world_size - 1) * page_size, 1, kv_lora_rank + qk_rope_head_dim),
                     dtype=self.store_dtype,
                     device=device,
                 )
         self.token_stride = kv_lora_rank + qk_rope_head_dim
         self.layer_transfer_counter = None
+        self.pad_device_indices = torch.arange(
+            size + page_size, size + page_size + (self.world_size - 1) * page_size
+        ).to(device)
 
         kv_size = self.get_kv_size_bytes()
         logger.info(
@@ -682,8 +690,8 @@ class MLATokenToKVPool(KVCache):
             page_size=self.page_size,
             item_size=self.token_stride,
             num_layers=self.layer_num,
-            src_layer_offset=np.prod(self.k_buffer.shape[1:]),
-            dst_layer_offset=np.prod(host_pool.k_buffer.shape[1:]),
+            src_layer_offset=np.prod(self.kv_buffer.shape[1:]),
+            dst_layer_offset=np.prod(host_pool.kv_buffer.shape[1:]),
         )
 
     def get_cpu_copy(self, indices):
@@ -712,6 +720,28 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+    def get_padded_device_indices(self, device_indices, device_indices_split):
+        device_indices_split = device_indices_split.to(self.device)
+        device_indices_len = len(device_indices)
+        block_size = device_indices_len // self.page_size
+        if block_size // self.world_size * self.world_size != block_size:
+            pad_block_size_per_rank = block_size // self.world_size + 1
+            pad_block_size = pad_block_size_per_rank * self.world_size - block_size
+            device_indices = torch.concat([device_indices, self.pad_device_indices[-pad_block_size * self.page_size:]])
+            if len(device_indices_split) < pad_block_size_per_rank * self.page_size:
+                device_indices_split = torch.concat([
+                    device_indices_split,
+                    self.pad_device_indices[(self.local_rank - 1) * self.page_size
+                                            : self.local_rank * self.page_size]
+                    ]
+                )
+        return device_indices, device_indices_split
+
+    def mla_kv_cache_all_gather(self, layer_id, device_indices, device_indices_split):
+        fragment_data = self.kv_buffer[layer_id][device_indices_split]
+        gathered_tensor = tensor_model_parallel_all_gather(fragment_data, dim=0, cache_all_gather=True)
+        self.kv_buffer[layer_id][device_indices] = gathered_tensor
 
 
 class DoubleSparseTokenToKVPool(KVCache):
