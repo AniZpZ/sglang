@@ -4,7 +4,7 @@
 #include "kernel.h"
 #include "marlin_template.h"
 
-namespace marlin_moe_wna16 {
+namespace MARLIN_NAMESPACE_NAME {
 
 template __global__ void Marlin<half, sglang::kU4B8.id(), 256, 1, 8, 8, true, pipe_stages, true, false, 0, false>( MARLIN_KERNEL_PARAMS );
 
