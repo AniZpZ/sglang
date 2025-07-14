@@ -1,5 +1,9 @@
 import torch
 
+from sgl_kernel.scalar_type import ScalarType
+
+from typing import Optional
+
 def gptq_marlin_gemm(a: torch.Tensor,
                      c: Optional[torch.Tensor],
                      b_q_weight: torch.Tensor,

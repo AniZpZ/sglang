@@ -74,6 +74,9 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     topk_softmax,
 )
+from sgl_kernel.quantization import (
+    gptq_marlin_gemm,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
