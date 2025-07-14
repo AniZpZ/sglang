@@ -248,7 +248,7 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
              m_block_size_8 == M_BLOCK_SIZE_8 &&                             \
              group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS &&   \
              is_zp_float == IS_ZP_FLOAT) {                                   \
-      kernel = Marlin<scalar_t, W_TYPE.id(), NUM_THREADS, THREAD_M_BLOCKS,   \
+      kernel = GPTQ_Marlin<scalar_t, W_TYPE.id(), NUM_THREADS, THREAD_M_BLOCKS,   \
                       THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8,      \
                       pipe_stages, GROUP_BLOCKS, IS_ZP_FLOAT>;               \
     }
