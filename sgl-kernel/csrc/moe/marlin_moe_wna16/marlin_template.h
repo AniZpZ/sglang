@@ -22,8 +22,8 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
-#include "marlin.cuh"
-#include "marlin_dtypes.cuh"
+#include "gemm/marlin/marlin.cuh"
+#include "gemm/marlin/marlin_dtypes.cuh"
 #include "scalar_type.hpp"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
