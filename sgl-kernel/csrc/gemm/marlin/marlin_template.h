@@ -18,6 +18,10 @@
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
  */
+#ifndef MARLIN_NAMESPACE_NAME
+#define MARLIN_NAMESPACE_NAME marlin
+#endif
+
 #include "dequant.h"
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
@@ -27,6 +31,8 @@
   static_assert(                                                                         \
       std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
       "only float16 and bfloat16 is supported");
+
+namespace MARLIN_NAMESPACE_NAME {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
@@ -1617,3 +1623,7 @@ __global__ void Marlin(
     }
   }
 }
+
+}  // namespace MARLIN_NAMESPACE_NAME
+
+#endif

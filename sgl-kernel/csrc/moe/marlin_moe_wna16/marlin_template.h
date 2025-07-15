@@ -18,6 +18,9 @@
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
  */
+#ifndef MARLIN_NAMESPACE_NAME
+#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
+#endif
 
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"

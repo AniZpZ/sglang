@@ -1,5 +1,6 @@
 #include "marlin.cuh"
 
+namespace marlin {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 // No support for async in awq_marlin_repack_kernel
 #else
@@ -169,6 +170,7 @@ __global__ void awq_marlin_repack_kernel(
       n_tile_id += repack_stages;
     }
   }
+}
 }
 
 #define CALL_IF(NUM_BITS)                                                                              \
