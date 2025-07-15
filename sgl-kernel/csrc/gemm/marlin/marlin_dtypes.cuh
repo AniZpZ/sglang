@@ -6,12 +6,6 @@
 
 #include "marlin.cuh"
 
-#ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
-#endif
-
-namespace MARLIN_NAMESPACE_NAME {
-
 template <typename scalar_t>
 class ScalarType {};
 
@@ -77,7 +71,3 @@ class ScalarType<nv_bfloat16> {
   }
 #endif
 };
-
-}  // namespace MARLIN_NAMESPACE_NAME
-
-#endif

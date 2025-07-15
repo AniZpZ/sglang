@@ -1,12 +1,4 @@
-#ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
-#endif
-
-#include "core/registration.h"
-#include "gptq_marlin/marlin.cuh"
-#include "kernel.h"
-
-namespace MARLIN_NAMESPACE_NAME {
+#include "marlin.cuh"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 // No support for async in awq_marlin_repack_kernel
@@ -249,7 +241,3 @@ awq_marlin_repack_meta(torch::Tensor& b_q_weight, c10::SymInt size_k, c10::SymIn
   auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
   return torch::empty_symint({size_k / tile_size, size_n * tile_size / pack_factor}, options);
 }
-
-#endif
-
-}  // namespace MARLIN_NAMESPACE_NAME

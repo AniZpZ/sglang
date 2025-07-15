@@ -23,7 +23,6 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
-#include "core/registration.h"
 #include "kernel.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \

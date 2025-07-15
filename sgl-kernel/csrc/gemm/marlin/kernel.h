@@ -3,8 +3,8 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
-#include "moe/marlin_moe_wna16/gptq_marlin/marlin.cuh"
-#include "moe/marlin_moe_wna16/gptq_marlin/marlin_dtypes.cuh"
+#include "marlin.cuh"
+#include "marlin_dtypes.cuh"
 #include "scalar_type.hpp"
 
 #define MARLIN_KERNEL_PARAMS                                                                                         \
