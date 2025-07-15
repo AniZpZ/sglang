@@ -306,3 +306,5 @@ gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_
 
   return out;
 }
+
+#endif

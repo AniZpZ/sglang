@@ -1,6 +1,9 @@
 #include "marlin.cuh"
 
 namespace marlin {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+// No support for async in gptq_marlin_repack_kernel
+#else
 
 template <int const num_threads, int const num_bits>
 __global__ void awq_marlin_repack_kernel(
@@ -233,3 +236,5 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64
 
   return out;
 }
+
+#endif
