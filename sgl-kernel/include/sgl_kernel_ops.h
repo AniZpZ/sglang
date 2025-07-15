@@ -235,6 +235,7 @@ torch::Tensor gptq_gemm(
     bool use_shuffle,
     int64_t bit);
 
+void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 /*
  * From csrc/moe
  */

@@ -1,4 +1,3 @@
-
 #ifndef _data_types_cuh
 #define _data_types_cuh
 #include <cuda_bf16.h>
@@ -71,3 +70,5 @@ class ScalarType<nv_bfloat16> {
   }
 #endif
 };
+
+#endif
