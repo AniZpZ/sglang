@@ -63,7 +63,7 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 */
 
-#include "moe/marlin_moe_wna16/gptq_marlin/marlin_dtypes.cuh"
+#include "marlin_dtypes.cuh"
 
 namespace MARLIN_NAMESPACE_NAME {
 
