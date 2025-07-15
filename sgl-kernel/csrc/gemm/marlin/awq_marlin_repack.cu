@@ -1,9 +1,6 @@
 #include "marlin.cuh"
 
 namespace marlin {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-// No support for async in awq_marlin_repack_kernel
-#else
 
 template <int const num_threads, int const num_bits>
 __global__ void awq_marlin_repack_kernel(
@@ -171,7 +168,7 @@ __global__ void awq_marlin_repack_kernel(
     }
   }
 }
-}
+}  // namespace marlin
 
 #define CALL_IF(NUM_BITS)                                                                              \
   else if (num_bits == NUM_BITS) {                                                                     \
@@ -235,11 +232,4 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64
   }
 
   return out;
-}
-
-torch::Tensor
-awq_marlin_repack_meta(torch::Tensor& b_q_weight, c10::SymInt size_k, c10::SymInt size_n, int64_t num_bits) {
-  int const pack_factor = 32 / num_bits;
-  auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
-  return torch::empty_symint({size_k / tile_size, size_n * tile_size / pack_factor}, options);
 }
