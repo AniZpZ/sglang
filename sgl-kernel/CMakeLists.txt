@@ -238,7 +238,7 @@ set(SOURCES
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
     "csrc/gemm/marlin/gptq_marlin.cu"
     "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    # "csrc/gemm/marlin/awq_marlin_repack.cu"
+    "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"

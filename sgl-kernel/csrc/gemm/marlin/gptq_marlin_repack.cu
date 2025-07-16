@@ -1,9 +1,17 @@
 #include "marlin.cuh"
 
+namespace marlin {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-// No support for async in gptq_marlin_repack_kernel
+template <int const num_threads, int const num_bits, bool const has_perm>
+__global__ void gptq_marlin_repack_kernel(
+    uint32_t const* __restrict__ b_q_weight_ptr,
+    uint32_t const* __restrict__ perm_ptr,
+    uint32_t* __restrict__ out_ptr,
+    int size_k,
+    int size_n) {
+  return;
+}
 #else
-
 template <int const num_threads, int const num_bits, bool const has_perm>
 __global__ void gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
@@ -17,7 +25,7 @@ __global__ void gptq_marlin_repack_kernel(
   int n_tiles = size_n / tile_n_size;
   int block_k_tiles = div_ceil(k_tiles, gridDim.x);
 
-  int start_k_tile = blockIdx.x * block_k_tiles;
+  auto start_k_tile = blockIdx.x * block_k_tiles;
   if (start_k_tile >= k_tiles) {
     return;
   }
@@ -73,8 +81,8 @@ __global__ void gptq_marlin_repack_kernel(
 
     if constexpr (has_perm) {
       if (threadIdx.x < stage_size) {
-        int k_id = threadIdx.x / stage_n_threads;
-        int n_id = threadIdx.x % stage_n_threads;
+        auto k_id = threadIdx.x / stage_n_threads;
+        auto n_id = threadIdx.x % stage_n_threads;
 
         uint32_t const* sh_perm_int_ptr = reinterpret_cast<uint32_t const*>(sh_perm_ptr);
 
@@ -88,8 +96,8 @@ __global__ void gptq_marlin_repack_kernel(
 
     } else {
       if (threadIdx.x < stage_size) {
-        int k_id = threadIdx.x / stage_n_threads;
-        int n_id = threadIdx.x % stage_n_threads;
+        auto k_id = threadIdx.x / stage_n_threads;
+        auto n_id = threadIdx.x % stage_n_threads;
 
         int first_k = k_tile_id * tile_k_size;
         int first_k_packed = first_k / pack_factor;
@@ -108,8 +116,8 @@ __global__ void gptq_marlin_repack_kernel(
       return;
     }
 
-    int warp_id = threadIdx.x / 32;
-    int th_id = threadIdx.x % 32;
+    auto warp_id = threadIdx.x / 32;
+    auto th_id = threadIdx.x % 32;
 
     if (warp_id >= 4) {
       return;
@@ -231,22 +239,35 @@ __global__ void gptq_marlin_repack_kernel(
     }
   }
 }
+#endif
+}  // namespace marlin
 
-#define CALL_IF(NUM_BITS, HAS_PERM)                                                                              \
-  else if (num_bits == NUM_BITS && has_perm == HAS_PERM) {                                                       \
-    cudaFuncSetAttribute(                                                                                        \
-        gptq_marlin_repack_kernel<repack_threads, NUM_BITS, HAS_PERM>,                                           \
-        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                             \
-        max_shared_mem);                                                                                         \
-    gptq_marlin_repack_kernel<repack_threads, NUM_BITS, HAS_PERM>                                                \
-        <<<blocks, repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n); \
+#define CALL_IF(NUM_BITS, HAS_PERM)                                                    \
+  else if (num_bits == NUM_BITS && has_perm == HAS_PERM) {                             \
+    cudaFuncSetAttribute(                                                              \
+        marlin::gptq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS, HAS_PERM>, \
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                   \
+        max_shared_mem);                                                               \
+    marlin::gptq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS, HAS_PERM>      \
+        <<<blocks, marlin::repack_threads, max_shared_mem, stream>>>(                  \
+            b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);                        \
   }
 
 torch::Tensor
 gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits) {
   // Verify compatibility with marlin tile of 16x64
-  TORCH_CHECK(size_k % tile_k_size == 0, "size_k = ", size_k, " is not divisible by tile_k_size = ", tile_k_size);
-  TORCH_CHECK(size_n % tile_n_size == 0, "size_n = ", size_n, " is not divisible by tile_n_size = ", tile_n_size);
+  TORCH_CHECK(
+      size_k % marlin::tile_k_size == 0,
+      "size_k = ",
+      size_k,
+      " is not divisible by tile_k_size = ",
+      marlin::tile_k_size);
+  TORCH_CHECK(
+      size_n % marlin::tile_n_size == 0,
+      "size_n = ",
+      size_n,
+      " is not divisible by tile_n_size = ",
+      marlin::tile_n_size);
 
   TORCH_CHECK(num_bits == 4 || num_bits == 8, "num_bits must be 4 or 8. Got = ", num_bits);
   int const pack_factor = 32 / num_bits;
@@ -274,7 +295,7 @@ gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_
   // Alloc buffers
   const at::cuda::OptionalCUDAGuard device_guard(device_of(b_q_weight));
   auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
-  torch::Tensor out = torch::empty({size_k / tile_size, size_n * tile_size / pack_factor}, options);
+  torch::Tensor out = torch::empty({size_k / marlin::tile_size, size_n * marlin::tile_size / pack_factor}, options);
 
   // Detect if there is act_order
   bool has_perm = perm.size(0) != 0;
@@ -306,5 +327,3 @@ gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_
 
   return out;
 }
-
-#endif
