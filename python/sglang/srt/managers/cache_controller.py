@@ -260,7 +260,6 @@ class HiCacheController:
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
-                assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
@@ -577,9 +576,14 @@ class HiCacheController:
                 break
 
     def mooncake_page_transfer(self, operation):
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            operation.hash_value, operation.host_indices
-        )
+        if self.mem_pool_host.layout == "page_first":
+            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta_pf(
+                operation.hash_value, operation.host_indices
+            )
+        else:
+            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta_lf(
+                operation.hash_value, operation.host_indices
+            )
         self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
         operation.increment(len(operation.hash_value) * self.page_size)
 
@@ -660,7 +664,10 @@ class HiCacheController:
 
                     if self.is_mooncake_backend():
                         # deferring to batch exists for mooncake store
-                        exist_result = self.storage_backend.exists(hash_value)
+                        if self.mem_pool_host.layout == "page_first":
+                            exist_result = self.storage_backend.exists(hash_value)
+                        else:
+                            exist_result = self.storage_backend.exists_lf(hash_value)
                         storage_hit_count = (
                             sum(1 for v in exist_result.values() if v != 0)
                             * self.page_size
@@ -730,7 +737,10 @@ class HiCacheController:
 
     def mooncake_page_backup(self, operation):
         if len(operation.hash_value):
-            exist_hashvalues = self.storage_backend.exists(operation.hash_value)
+            if self.mem_pool_host.layout == "page_first":
+                exist_hashvalues = self.storage_backend.exists(operation.hash_value)
+            else:
+                exist_hashvalues = self.storage_backend.exists_lf(operation.hash_value)
             indices = operation.host_indices.tolist()
             non_exist_keys = []
             non_exist_indices = []
@@ -741,11 +751,18 @@ class HiCacheController:
                         indices[i * self.page_size : (i + 1) * self.page_size]
                     )
             if len(non_exist_keys) > 0:
-                key_strs, buffer_ptrs, buffer_sizes = (
-                    self.mem_pool_host.get_buffer_meta(
-                        non_exist_keys, non_exist_indices
+                if self.mem_pool_host.layout == "page_first":
+                    key_strs, buffer_ptrs, buffer_sizes = (
+                        self.mem_pool_host.get_buffer_meta_pf(
+                            non_exist_keys, non_exist_indices
+                        )
                     )
-                )
+                else:
+                    key_strs, buffer_ptrs, buffer_sizes = (
+                        self.mem_pool_host.get_buffer_meta_lf(
+                            non_exist_keys, non_exist_indices
+                        )
+                    )
                 # TODO: check the return value of batch set to see how many tokens are set successfully
                 self.storage_backend.batch_set(
                     key_strs,

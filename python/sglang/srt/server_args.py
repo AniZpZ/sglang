@@ -578,8 +578,8 @@ class ServerArgs:
         # Hicache
         if self.hicache_storage_backend == "mooncake":
             # to use mooncake storage backend, the following conditions must be met:
-            self.hicache_io_backend = "kernel"
-            self.hicache_mem_layout = "page_first"
+            if self.hicache_mem_layout == "page_first":
+                self.hicache_io_backend = "kernel"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":

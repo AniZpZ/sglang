@@ -231,6 +231,15 @@ class MooncakeStore(HiCacheStorage):
         result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
         return result
 
+    def exists_lf(self, keys):
+        _keys = []
+        for key in keys:
+            if key is None:
+                return None
+            _keys.append(f"{key}_0_k")
+        result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
+        return result
+
     def delete(self, key) -> None:
         raise (NotImplementedError)
 

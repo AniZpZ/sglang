@@ -460,7 +460,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta_pf(self, keys, indices):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -492,6 +492,43 @@ class MHATokenToKVPoolHost(HostKVCache):
             * self.page_size
             * self.head_num
             * self.head_dim
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
+
+    def get_buffer_meta_lf(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        v_offset = (
+            self.layer_num
+            * self.size
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                )
+                v_ptr = k_ptr + v_offset
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+                key_list.append(f"{key_}_{layer_id}_v")
+        element_size = (
+            self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
@@ -681,7 +718,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta_pf(self, keys, indices):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -699,6 +736,34 @@ class MLATokenToKVPoolHost(HostKVCache):
         element_size = (
             self.layer_num
             * self.dtype.itemsize
+            * self.page_size
+            * (self.kv_lora_rank + self.qk_rope_head_dim)
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
+
+
+    def get_buffer_meta_lf(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+        element_size = (
+            self.dtype.itemsize
             * self.page_size
             * (self.kv_lora_rank + self.qk_rope_head_dim)
         )
