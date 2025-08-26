@@ -5,6 +5,7 @@ import collections
 import concurrent
 import dataclasses
 import fnmatch
+import gc
 import glob
 import json
 import logging
@@ -638,7 +639,6 @@ class DefaultModelLoader(BaseModelLoader):
 
         del original_param_dict
         del existing_params
-        import gc
 
         gc.collect()
 
