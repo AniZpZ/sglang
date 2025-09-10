@@ -94,7 +94,7 @@ from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, check_updated
 from sglang.srt.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -941,7 +941,16 @@ class ModelRunner:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            self.model.load_weights(named_tensors)
+            # Auto-detect Flash-RL based on environment variable
+            flashrl_config = os.getenv("FLASHRL_CONFIG")
+            if flashrl_config:
+                # Auto-enable Flash-RL if not already enabled
+                if not hasattr(self.model, 'flashrl_quant_fn'):
+                    quant_fn = flashrl_config if flashrl_config in ['bf16', 'fp8', 'int8'] else 'fp8'
+                    self._auto_enable_flashrl(quant_fn)
+                self._flashrl_enhanced_load_weights(named_tensors)
+            else:
+                self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -977,6 +986,202 @@ class ModelRunner:
         self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
+
+    def _flashrl_enhanced_load_weights(self, named_tensors):
+        """Enhanced load_weights method with Flash-RL support and reload logic."""
+        # Check if this is first time loading or reload
+        is_first_time = not hasattr(self.model, 'hacked_original_weights_rebuild_keys')
+        
+        if is_first_time:
+            # First time loading - initialize Flash-RL state
+            self._initialize_flashrl_state()
+            # Standard loading for first time
+            updated_params = self._first_time_load_weights(named_tensors)
+            self.model.hacked_updated_params = updated_params
+        else:
+            # Subsequent loading - use reload and rebind logic
+            updated_params = self._rebinding_and_load_weights(named_tensors)
+            
+    def _initialize_flashrl_state(self):
+        """Initialize Flash-RL state for first time loading."""
+        # Save original weight state for potential reloading
+        if not hasattr(self.model, "hacked_original_weights_rebuild_keys"):
+            self.model.hacked_original_weights_rebuild_keys = {}
+            for name, p in self.model.named_parameters():
+                self.model.hacked_original_weights_rebuild_keys[name] = (
+                    p.shape, p.stride(), p.dtype, p.untyped_storage().nbytes()
+                )
+
+        # Record weight loaders for potential reloading
+        recorded_loader_keys = [
+            "weight_loader",
+            "load_qkv_weight", 
+            "load_row_parallel_weight",
+            "load_merged_column_weight",
+            "output_dim",
+            "input_dim",
+            "_assert_and_load",
+        ]
+
+        recorded_loader = {k: dict() for k in recorded_loader_keys}
+        for name, p in self.model.named_parameters():
+            for key in recorded_loader_keys:
+                if hasattr(p, key):
+                    attr = getattr(p, key)
+                    if not callable(attr):
+                        recorded_loader[key][name] = attr
+                    elif p is attr.__self__:
+                        recorded_loader[key][name] = attr.__func__
+                    else:
+                        recorded_loader[key][name] = attr
+        self.model.hacked_recorded_loader = recorded_loader
+        
+        # Initialize hacked_data_dict
+        hacked_data_dict = {}
+        for name, p in self.model.named_parameters():
+            hacked_data_dict[name] = p.data
+        self.model.hacked_data_dict = hacked_data_dict
+
+    def _first_time_load_weights(self, named_tensors):
+        """First time weight loading with tracking."""
+        # Track which parameters are being updated
+        updated_params = set()
+        for name, _ in named_tensors:
+            updated_params.add(name)
+            
+        # Call original load_weights
+        self.model.load_weights(named_tensors)
+        
+        return updated_params
+
+    def _rebinding_and_load_weights(self, named_tensors):
+        """Reload weights with proper state management for multiple loading scenarios."""
+        # Reset the model state to allow re-quantization 
+        self._reset_model_weights_state()
+
+        # Preserve workspace if exists
+        for _, module in self.model.named_modules():
+            if torch.is_tensor(getattr(module, "workspace", None)):
+                setattr(module, f"hacked_workspace", getattr(module, "workspace"))
+
+        existing_params = dict(self.model.named_parameters())
+
+        # Preserve original data, so that after parameter loading, we can put the parameter
+        # in the original tensor
+        hacked_data_dict = {}
+        for name, p in existing_params.items():
+            hacked_data_dict[name] = p.data
+
+        # Recover the parameter to the state before first loading
+        for name, rebuild_info in self.model.hacked_original_weights_rebuild_keys.items():
+            if name in existing_params:
+                shape, stride, dtype, nbytes = rebuild_info
+                existing_params[name].data = torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device=existing_params[name].device,
+                )
+
+        # Restore weight loaders
+        for k, loader_k in self.model.hacked_recorded_loader.items():
+            for n, loader in loader_k.items():
+                if not hasattr(existing_params[n], k):
+                    # Simple binding for now - in a full implementation you might need
+                    # a more sophisticated binding mechanism
+                    setattr(existing_params[n], k, loader)
+
+        # After recovering, the weight loading can be called as usual
+        updated_params = self._first_time_load_weights(named_tensors)
+
+        # Manually conducting process weights after loading
+        # Note: We don't need to call load_weights_and_postprocess here because
+        # first_time_load_weights already loaded the weights, we just need to process them
+        target_device = next(self.model.parameters()).device
+        for _, module in self.model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                try:
+                    # Try to import device_loading_context from different possible locations
+                    try:
+                        from sglang.srt.model_loader.loader import device_loading_context
+                    except ImportError:
+                        from sglang.srt.model_loader.utils import device_loading_context
+                    
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+                except ImportError:
+                    # Fallback if device_loading_context is not available
+                    quant_method.process_weights_after_loading(module)
+
+        # Mark as already called
+        if not hasattr(self.model, 'hacked_not_need_process_weights_after_loading'):
+            self.model.hacked_not_need_process_weights_after_loading = True
+
+        # Put the value of the newly created tensor to the original tensor
+        skipped_params = []
+        for name, p in self.model.named_parameters():
+            quant_fn_name = getattr(self.model, 'flashrl_quant_fn', 'bf16')
+            if check_updated(name, updated_params, quant_fn_name):
+                strided_data = torch.as_strided(
+                    p.data,
+                    hacked_data_dict[name].shape,
+                    hacked_data_dict[name].stride(),
+                )
+                hacked_data_dict[name].copy_(strided_data)
+            else:
+                skipped_params.append(name)
+
+            tmp_data = p.data
+            p.data = hacked_data_dict[name]
+            del tmp_data
+
+        logger.debug(f"flash_rl load_weights skipped params: {skipped_params}")
+        del skipped_params
+        del existing_params
+
+        gc.collect()
+
+        # Restore workspace
+        for _, module in self.model.named_modules():
+            if torch.is_tensor(getattr(module, "hacked_workspace", None)):
+                setattr(module, "workspace", getattr(module, "hacked_workspace"))
+                delattr(module, "hacked_workspace")
+
+        return updated_params
+
+    def _reset_model_weights_state(self):
+        """Reset the model's weight state to allow re-quantization."""
+        if hasattr(self.model, 'hacked_not_need_process_weights_after_loading'):
+            self.model.hacked_not_need_process_weights_after_loading = False
+
+        # Restore original weight state if available
+        if hasattr(self.model, "hacked_original_weights_rebuild_keys"):
+            existing_params = dict(self.model.named_parameters())
+            for name, rebuild_info in self.model.hacked_original_weights_rebuild_keys.items():
+                if name in existing_params:
+                    param = existing_params[name]
+                    if param is not None:
+                        # Create new tensor with original shape and dtype
+                        try:
+                            shape, stride, dtype, nbytes = rebuild_info
+                            new_data = torch.empty(
+                                shape,
+                                dtype=dtype,
+                                device=param.device,
+                            )
+                            param.data = new_data
+                        except Exception as e:
+                            logger.warning(f"Failed to reset parameter {name}: {e}")
+                            # Continue with other parameters
+                            continue
+
+    def _auto_enable_flashrl(self, quant_fn='fp8'):
+        """Auto-enable Flash-RL support based on environment variable."""
+        if not hasattr(self.model, 'flashrl_quant_fn'):
+            self.model.flashrl_quant_fn = quant_fn
+            logger.info(f"Auto-enabled Flash-RL with quantization function: {quant_fn} (from FLASHRL_CONFIG)")
+        else:
+            logger.debug("Flash-RL already enabled for this model")
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
