@@ -48,6 +48,19 @@ logger = logging.getLogger(__name__)
 temp_dir = tempfile.gettempdir()
 
 
+def check_updated(name, updated_params, quant_fn_name):
+    """Check if a parameter was updated during weight loading."""
+    if name in updated_params:
+        return True
+     
+    if quant_fn_name in ['fp8', 'fp8_vllm', 'fp8_vllm_fast', 'fp8_fast'] \
+            and name.endswith('weight_scale') \
+            and name[:-6] in updated_params:
+        return True
+    
+    return False
+
+
 def enable_hf_transfer():
     """automatically activates hf_transfer"""
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:

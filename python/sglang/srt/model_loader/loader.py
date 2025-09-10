@@ -7,6 +7,7 @@ import collections
 import concurrent
 import dataclasses
 import fnmatch
+import gc
 import glob
 import json
 import logging
@@ -85,6 +86,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -487,8 +490,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        # Load weights first
         model.load_weights(weights)
 
+        # Process weights after loading (quantization, etc.)
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -499,6 +504,7 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
 
 
 class LayeredModelLoader(DefaultModelLoader):
