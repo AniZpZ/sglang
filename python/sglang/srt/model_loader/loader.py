@@ -476,12 +476,32 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+
+class FlashRLModelLoader(DefaultModelLoader):
+    """Model loader with FlashRL-specific functionality for advanced weight management."""
+
+    @staticmethod
+    def _initialize_flashrl_state(model):
+        """Initialize FlashRL-specific state for the model."""
         # Check if already called to prevent duplicate processing
         if getattr(model, "process_weights_after_loading_already_called", False):
             logger.debug(
                 "process_weights_after_loading already called for model %s", model
             )
-            return
+            return True  # Return True to indicate already initialized
 
         # Save original weight state for potential reloading
         if not hasattr(model, "original_weights_rebuild_keys"):
@@ -517,21 +537,17 @@ class DefaultModelLoader(BaseModelLoader):
                     else:
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
+        return False  # Return False to indicate initialization just completed
 
-        # Load weights first
-        model.load_weights(weights)
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        # Initialize FlashRL state and check if already processed
+        already_initialized = FlashRLModelLoader._initialize_flashrl_state(model)
+        if already_initialized:
+            return
 
-        # Process weights after loading (quantization, etc.)
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        # Use parent implementation for the core weight loading and processing
+        DefaultModelLoader.load_weights_and_postprocess(model, weights, target_device)
 
         # Mark as already called to prevent duplicate processing
         model.process_weights_after_loading_already_called = True
@@ -566,7 +582,7 @@ class DefaultModelLoader(BaseModelLoader):
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
-        DefaultModelLoader.reset_model_weights_state(model)
+        FlashRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
         for _, module in model.named_modules():
@@ -1730,5 +1746,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.FLASHRL:
+        return FlashRLModelLoader(load_config)
 
     return DefaultModelLoader(load_config)
