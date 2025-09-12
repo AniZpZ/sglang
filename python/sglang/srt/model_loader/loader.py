@@ -490,7 +490,7 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
-class FlashRLModelLoader(DefaultModelLoader):
+class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
     @staticmethod
@@ -542,7 +542,7 @@ class FlashRLModelLoader(DefaultModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         # Initialize FlashRL state and check if already processed
-        already_initialized = FlashRLModelLoader._initialize_flashrl_state(model)
+        already_initialized = QuantizedRLModelLoader._initialize_flashrl_state(model)
         if already_initialized:
             return
 
@@ -582,7 +582,7 @@ class FlashRLModelLoader(DefaultModelLoader):
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
-        FlashRLModelLoader.reset_model_weights_state(model)
+        QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
         for _, module in model.named_modules():
@@ -1748,6 +1748,6 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
         return RemoteModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.FLASHRL:
-        return FlashRLModelLoader(load_config)
+        return QuantizedRLModelLoader(load_config)
 
     return DefaultModelLoader(load_config)
