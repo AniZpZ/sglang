@@ -60,6 +60,7 @@ LOAD_FORMAT_CHOICES = [
     "bitsandbytes",
     "layered",
     "remote",
+    "flashrl"
 ]
 
 QUANTIZATION_CHOICES = [
