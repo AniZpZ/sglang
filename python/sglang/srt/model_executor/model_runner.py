@@ -95,7 +95,7 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import DefaultModelLoader, QuantizedRLModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
@@ -210,6 +210,9 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        
+        # Initialize quantized RL support
+        self.enable_quantized_rl = getattr(server_args, 'enable_quantized_rl', False)
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -926,7 +929,15 @@ class ModelRunner:
             for handle in handles:
                 handle.wait()
 
-            self.model.load_weights(weights)
+            # Use quantized RL-aware weight loading if enabled
+            if self.enable_quantized_rl:
+                QuantizedRLModelLoader.quantized_rl_load_weights(
+                    self.model, weights, self.model.load_weights
+                )
+            else:
+                # Standard weight loading
+                self.model.load_weights(weights)
+                
             return True, f"Succeeded to update parameter online."
 
         except Exception as e:
@@ -1939,6 +1950,39 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+    
+    def enable_quantized_rl_mode(self):
+        """Enable quantized RL mode for this model runner."""
+        if self.enable_quantized_rl:
+            logger.warning("Quantized RL mode already enabled")
+            return
+            
+        self.enable_quantized_rl = True
+        logger.info("Quantized RL mode enabled")
+        
+    def disable_quantized_rl_mode(self):
+        """Disable quantized RL mode for this model runner."""
+        if not self.enable_quantized_rl:
+            logger.warning("Quantized RL mode already disabled")
+            return
+            
+        self.enable_quantized_rl = False
+        logger.info("Quantized RL mode disabled")
+        
+    def is_quantized_rl_enabled(self) -> bool:
+        """Check if quantized RL mode is enabled."""
+        return self.enable_quantized_rl
+        
+    def reset_quantized_rl_state(self):
+        """Reset the quantized RL state of the model."""
+        if not self.enable_quantized_rl:
+            logger.warning("Quantized RL mode not enabled")
+            return
+            
+        if QuantizedRLModelLoader.quantized_rl_reset_state(self.model):
+            logger.info("Quantized RL state reset successfully")
+        else:
+            logger.warning("No quantized RL state to reset")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

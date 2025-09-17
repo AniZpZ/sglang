@@ -174,6 +174,9 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
 
+    # Quantized RL support
+    enable_quantized_rl: bool = False
+
     # Runtime options
     device: Optional[str] = None
     tp_size: int = 1
@@ -1104,6 +1107,13 @@ class ServerArgs:
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
+        )
+
+        # Quantized RL support
+        parser.add_argument(
+            "--enable-quantized-rl",
+            action="store_true",
+            help="Enable quantized reinforcement learning support for proper parameter updates in quantized models.",
         )
 
         # Runtime options

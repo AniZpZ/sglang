@@ -569,28 +569,31 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     @staticmethod
     def reset_model_weights_state(model):
         """Reset the model's weight state to allow re-quantization."""
+        if not hasattr(model, "original_weights_rebuild_keys"):
+            logger.warning("No quantized RL state to reset - model not initialized")
+            return
+            
         model.process_weights_after_loading_already_called = False
 
         # Restore original weight state if available
-        if hasattr(model, "original_weights_rebuild_keys"):
-            for name, rebuild_info in model.original_weights_rebuild_keys.items():
-                if hasattr(model, name):
-                    param = getattr(model, name)
-                    if param is not None:
-                        # Create new tensor with original shape and dtype
-                        # Note: This is a simplified reset - in practice, you might need
-                        # to handle more complex cases like quantized parameters
-                        try:
-                            new_data = torch.empty(
-                                rebuild_info["shape"],
-                                dtype=rebuild_info["dtype"],
-                                device=param.device,
-                            )
-                            param.data = new_data
-                        except Exception as e:
-                            logger.warning(f"Failed to reset parameter {name}: {e}")
-                            # Continue with other parameters
-                            continue
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+            if hasattr(model, name):
+                param = getattr(model, name)
+                if param is not None:
+                    # Create new tensor with original shape and dtype
+                    # Note: This is a simplified reset - in practice, you might need
+                    # to handle more complex cases like quantized parameters
+                    try:
+                        new_data = torch.empty(
+                            rebuild_info["shape"],
+                            dtype=rebuild_info["dtype"],
+                            device=param.device,
+                        )
+                        param.data = new_data
+                    except Exception as e:
+                        logger.warning(f"Failed to reset parameter {name}: {e}")
+                        # Continue with other parameters
+                        continue
 
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
@@ -679,6 +682,60 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 delattr(module, "preserved_workspace")
 
         return updated_params
+
+    @staticmethod
+    def quantized_rl_load_weights(model, weights, original_load_weights_fn):
+        """
+        Load weights with quantized RL-aware state management.
+        
+        This method automatically handles first-time initialization and subsequent
+        weight updates for quantized reinforcement learning models, ensuring proper
+        parameter rebinding after quantization operations.
+        
+        Args:
+            model: The model to load weights into
+            weights: Iterator of (name, tensor) pairs
+            original_load_weights_fn: The original model.load_weights function
+            
+        Returns:
+            Updated parameters set (for subsequent loads) or None (for first load)
+        """
+        # Check if this is the first time loading weights
+        first_time_load = not hasattr(model, 'original_weights_rebuild_keys')
+        
+        if first_time_load:
+            # First time loading - use standard process but initialize FlashRL state
+            result = original_load_weights_fn(weights)
+            QuantizedRLModelLoader._initialize_flashrl_state(model)
+            return result
+        else:
+            # Subsequent loading - use FlashRL rebinding process
+            def first_time_load_weights(weights_iter):
+                return original_load_weights_fn(weights_iter)
+            
+            return QuantizedRLModelLoader.rebinding_and_load_weights(
+                model, first_time_load_weights, weights
+            )
+
+    @staticmethod
+    def quantized_rl_reset_state(model):
+        """
+        Reset quantized RL state for model parameter reloading.
+        
+        This method safely resets the quantized RL state if it exists, allowing
+        for clean reinitialization of the model's quantization parameters.
+        
+        Args:
+            model: The model to reset state for
+            
+        Returns:
+            bool: True if state was reset, False if no state existed
+        """
+        if hasattr(model, 'original_weights_rebuild_keys'):
+            QuantizedRLModelLoader.reset_model_weights_state(model)
+            return True
+        else:
+            return False
 
 
 class LayeredModelLoader(DefaultModelLoader):
