@@ -215,9 +215,6 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
 
-        # Initialize quantized RL support
-        self.enable_quantized_rl = getattr(server_args, "enable_quantized_rl", False)
-
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
             logger.addFilter(RankZeroFilter(tp_rank == 0))

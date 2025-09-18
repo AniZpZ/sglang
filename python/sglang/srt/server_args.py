@@ -174,9 +174,6 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
 
-    # Quantized RL support
-    enable_quantized_rl: bool = False
-
     # Runtime options
     device: Optional[str] = None
     tp_size: int = 1
