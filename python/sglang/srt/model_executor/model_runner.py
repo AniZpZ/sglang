@@ -806,9 +806,9 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # Only support DefaultModelLoader for now
+        # Support DefaultModelLoader and QuantizedRLModelLoader for now
         loader = get_model_loader(load_config)
-        if not isinstance(loader, DefaultModelLoader):
+        if not isinstance(loader, (DefaultModelLoader, QuantizedRLModelLoader)):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
@@ -819,7 +819,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -929,14 +929,7 @@ class ModelRunner:
             for handle in handles:
                 handle.wait()
 
-            # Use quantized RL-aware weight loading if enabled
-            if self.enable_quantized_rl:
-                QuantizedRLModelLoader.quantized_rl_load_weights(
-                    self.model, weights, self.model.load_weights
-                )
-            else:
-                # Standard weight loading
-                self.model.load_weights(weights)
+            self.model.load_weights(weights)
                 
             return True, f"Succeeded to update parameter online."
 
@@ -975,13 +968,8 @@ class ModelRunner:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            # Use quantized RL-aware weight loading if enabled
-            if self.enable_quantized_rl:
-                QuantizedRLModelLoader.quantized_rl_load_weights(
-                    self.model, named_tensors, self.model.load_weights
-                )
-            else:
-                self.model.load_weights(named_tensors)
+            # Load weights (automatically handles quantized RL if enabled)
+            self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -1013,14 +1001,8 @@ class ModelRunner:
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
-        # Load the reconstructed tensors using quantized RL-aware method if enabled
-        if self.enable_quantized_rl:
-            QuantizedRLModelLoader.quantized_rl_load_weights(
-                self.model, reconstructed_tensors, self.model.load_weights
-            )
-        else:
-            # Load the reconstructed tensors using the standard method
-            self.model.load_weights(reconstructed_tensors)
+        # Load the reconstructed tensors (automatically handles quantized RL if enabled)
+        self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
 
@@ -1963,38 +1945,7 @@ class ModelRunner:
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
     
-    def enable_quantized_rl_mode(self):
-        """Enable quantized RL mode for this model runner."""
-        if self.enable_quantized_rl:
-            logger.warning("Quantized RL mode already enabled")
-            return
-            
-        self.enable_quantized_rl = True
-        logger.info("Quantized RL mode enabled")
-        
-    def disable_quantized_rl_mode(self):
-        """Disable quantized RL mode for this model runner."""
-        if not self.enable_quantized_rl:
-            logger.warning("Quantized RL mode already disabled")
-            return
-            
-        self.enable_quantized_rl = False
-        logger.info("Quantized RL mode disabled")
-        
-    def is_quantized_rl_enabled(self) -> bool:
-        """Check if quantized RL mode is enabled."""
-        return self.enable_quantized_rl
-        
-    def reset_quantized_rl_state(self):
-        """Reset the quantized RL state of the model."""
-        if not self.enable_quantized_rl:
-            logger.warning("Quantized RL mode not enabled")
-            return
-            
-        if QuantizedRLModelLoader.quantized_rl_reset_state(self.model):
-            logger.info("Quantized RL state reset successfully")
-        else:
-            logger.warning("No quantized RL state to reset")
+    
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
