@@ -975,7 +975,13 @@ class ModelRunner:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            self.model.load_weights(named_tensors)
+            # Use quantized RL-aware weight loading if enabled
+            if self.enable_quantized_rl:
+                QuantizedRLModelLoader.quantized_rl_load_weights(
+                    self.model, named_tensors, self.model.load_weights
+                )
+            else:
+                self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -1007,8 +1013,14 @@ class ModelRunner:
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
-        # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
+        # Load the reconstructed tensors using quantized RL-aware method if enabled
+        if self.enable_quantized_rl:
+            QuantizedRLModelLoader.quantized_rl_load_weights(
+                self.model, reconstructed_tensors, self.model.load_weights
+            )
+        else:
+            # Load the reconstructed tensors using the standard method
+            self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
 
