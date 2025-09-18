@@ -95,7 +95,11 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, QuantizedRLModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    QuantizedRLModelLoader,
+    get_model_loader,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
@@ -210,9 +214,9 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
-        
+
         # Initialize quantized RL support
-        self.enable_quantized_rl = getattr(server_args, 'enable_quantized_rl', False)
+        self.enable_quantized_rl = getattr(server_args, "enable_quantized_rl", False)
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -930,7 +934,6 @@ class ModelRunner:
                 handle.wait()
 
             self.model.load_weights(weights)
-                
             return True, f"Succeeded to update parameter online."
 
         except Exception as e:
@@ -968,7 +971,6 @@ class ModelRunner:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            # Load weights (automatically handles quantized RL if enabled)
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
@@ -1000,8 +1002,7 @@ class ModelRunner:
             flattened_tensor=flattened_tensor, metadata=converted_metadata
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
-
-        # Load the reconstructed tensors (automatically handles quantized RL if enabled)
+        # Load the reconstructed tensors based on model loader
         self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
@@ -1944,8 +1945,6 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
-    
-    
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

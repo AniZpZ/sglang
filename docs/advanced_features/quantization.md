@@ -159,7 +159,7 @@ FP8 rollout addresses a specific challenge in reinforcement learning (RL) traini
 
 **Key challenges:**
 - **Mixed precision workflows**: Load BF16 weights, shard across devices, then quantize online to FP8
-- **Frequent updates**: RL training requires multiple weight synchronizations per iteration  
+- **Frequent updates**: RL training requires multiple weight synchronizations per iteration
 - **State preservation**: FP8 quantization creates scaling factors and metadata that must persist across updates
 - **Memory efficiency**: Avoid redundant quantization operations and maintain tensor memory locations for optimized CUDA kernels
 
