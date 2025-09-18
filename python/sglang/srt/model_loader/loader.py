@@ -507,6 +507,54 @@ class DefaultModelLoader(BaseModelLoader):
 class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Patch the load_weights by loading model and override its load_weights method with quantized RL logic."""
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+        # Simply override the load_weights method - much cleaner!
+        original_load_weights = model.load_weights
+
+        def quantized_rl_load_weights(weights):
+            return QuantizedRLModelLoader.quantized_rl_load_weights(
+                model, weights, original_load_weights
+            )
+
+        model.load_weights = quantized_rl_load_weights
+        logger.info(
+            "QuantizedRLModelLoader: Overrode model.load_weights with quantized RL logic"
+        )
+
+        # Load weights using our custom load_weights_and_postprocess
+        self.load_weights_and_postprocess(
+            model, self._get_all_weights(model_config, model), target_device
+        )
+
+        return model.eval()
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    ):
+        """Override to handle LoadFormat.FLASHRL by treating it as AUTO."""
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
+        # FLASHRL uses the same weight loading as AUTO, difference is in processing
+        temp_config = LoadConfig(load_format=LoadFormat.AUTO)
+        temp_loader = DefaultModelLoader(temp_config)
+        return temp_loader._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt
+        )
+
     @staticmethod
     def _initialize_flashrl_state(model):
         """Initialize FlashRL-specific state for the model."""
@@ -555,16 +603,20 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        # Initialize FlashRL state and check if already processed
-        already_initialized = QuantizedRLModelLoader._initialize_flashrl_state(model)
-        if already_initialized:
-            return
+        # Load weights using the overridden model.load_weights method
+        model.load_weights(weights)
 
-        # Use parent implementation for the core weight loading and processing
-        DefaultModelLoader.load_weights_and_postprocess(model, weights, target_device)
-
-        # Mark as already called to prevent duplicate processing
-        model.process_weights_after_loading_already_called = True
+        # Handle quantization postprocessing
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
 
     @staticmethod
     def reset_model_weights_state(model):
@@ -708,6 +760,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             # First time loading - use standard process but initialize FlashRL state
             result = original_load_weights_fn(weights)
             QuantizedRLModelLoader._initialize_flashrl_state(model)
+            # Mark as initialized to prevent duplicate processing
+            model.process_weights_after_loading_already_called = True
             return result
         else:
             # Subsequent loading - use FlashRL rebinding process

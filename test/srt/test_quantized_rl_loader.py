@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Test for QuantizedRLModelLoader integration with model runner.
+Comprehensive tests for QuantizedRLModelLoader integration with SGLang.
 
-This test:
-1. Tests the complete model loading workflow using LoadFormat.FLASHRL
-2. Verifies integration with ModelRunner configuration
-3. Tests weight updates through the proper model loader pipeline
-4. Uses SGLang's configuration system for consistent testing
+Tests the complete workflow from configuration to weight updates,
+including automatic model.load_weights override and FlashRL state management.
 """
 
 import sys
@@ -68,83 +65,87 @@ class TestQuantizedRLLoaderIntegration(CustomTestCase):
         device_str = auto_config_device()
         self.device = torch.device(device_str)
 
-    def test_flashrl_loader_selection(self):
-        """Test that LoadFormat.FLASHRL correctly selects QuantizedRLModelLoader."""
-        # Create load config with FLASHRL format
+    def test_complete_quantized_rl_workflow(self):
+        """Test the complete QuantizedRL workflow: loader selection, model loading, and weight updates."""
+        # 1. Verify LoadFormat.FLASHRL routes to QuantizedRLModelLoader
         load_config = self.LoadConfig(load_format=self.LoadFormat.FLASHRL)
-
-        # Get the model loader
         loader = self.get_model_loader(load_config)
-
-        # Verify it's the QuantizedRLModelLoader
         self.assertIsInstance(loader, self.QuantizedRLModelLoader)
 
-    def test_model_loading_with_flashrl_config(self):
-        """Test complete model loading workflow using FLASHRL configuration."""
-        # Create configurations
-        load_config = self.LoadConfig(load_format=self.LoadFormat.FLASHRL)
+        # 2. Load model using QuantizedRLModelLoader
         device_config = self.DeviceConfig(device=self.device.type)
 
-        # Create a mock model config (since we're using a test model)
-        model_config = self._create_mock_model_config()
+        # Patch _initialize_model to return our test model
+        test_model = self._create_test_model()
+        import sglang.srt.model_loader.loader as loader_module
 
-        # Test that get_model works with FLASHRL config
-        # Note: This would normally load a real model, but we'll test the loader selection
-        loader = self.get_model_loader(load_config)
-        self.assertIsInstance(loader, self.QuantizedRLModelLoader)
+        original_initialize_model = loader_module._initialize_model
+        loader_module._initialize_model = lambda model_config, load_config: test_model
 
-    def test_quantized_rl_weight_updates_through_loader(self):
-        """Test weight updates using QuantizedRLModelLoader through proper config."""
-        # Create loader with FLASHRL config
+        try:
+            model = loader.load_model(
+                model_config=self._create_mock_model_config(),
+                device_config=device_config,
+            )
+
+            # Verify FlashRL state was initialized
+            self._assert_flashrl_state_initialized(model)
+        finally:
+            loader_module._initialize_model = original_initialize_model
+
+        # 3. Test weight updates with overridden load_weights method
+        initial_state = self._capture_model_state(model)
+
+        # First update
+        update1_weights = self._create_updated_weights_simulation(model, update_id=1)
+        model.load_weights(update1_weights)
+        self._assert_flashrl_state_preserved(model)
+        self._assert_weights_changed(model, initial_state, "first update")
+
+        # Second update
+        update1_state = self._capture_model_state(model)
+        update2_weights = self._create_updated_weights_simulation(model, update_id=2)
+        model.load_weights(update2_weights)
+        self._assert_flashrl_state_preserved(model)
+        self._assert_weights_changed(model, update1_state, "second update")
+
+    def test_quantized_rl_state_reset_and_recovery(self):
+        """Test FlashRL state reset and recovery workflow."""
         load_config = self.LoadConfig(load_format=self.LoadFormat.FLASHRL)
         loader = self.get_model_loader(load_config)
+        device_config = self.DeviceConfig(device=self.device.type)
 
-        # Create a test model
-        model = self._create_test_model()
+        # Patch _initialize_model to return our test model
+        test_model = self._create_test_model()
+        import sglang.srt.model_loader.loader as loader_module
 
-        # Verify initial state (no FlashRL state)
-        self._assert_no_flashrl_state(model)
+        original_initialize_model = loader_module._initialize_model
+        loader_module._initialize_model = lambda model_config, load_config: test_model
 
-        # First load using the loader (simulates initial model loading)
-        weights = self._create_weights_from_disk_simulation(model)
-        loader.load_weights_and_postprocess(model, weights, self.device)
-
-        # Verify FlashRL state was initialized
-        self._assert_flashrl_state_initialized(model)
-
-        # Record initial parameter values for comparison
-        initial_param_values = self._capture_model_state(model)
-
-        # Simulate weight update using the model's load_weights method directly
-        # (this is how the QuantizedRLModelLoader would call it)
-        updated_weights = self._create_updated_weights_simulation(model, update_id=1)
-        model.load_weights(updated_weights)
-
-        # Verify weights changed (FlashRL state management happens in the loader)
-        self._assert_weights_changed(model, initial_param_values, "update 1")
-
-    def test_quantized_rl_reset_functionality(self):
-        """Test FlashRL state reset functionality."""
-        # Create loader and model
-        load_config = self.LoadConfig(load_format=self.LoadFormat.FLASHRL)
-        loader = self.get_model_loader(load_config)
-        model = self._create_test_model()
-
-        # Initial load
-        weights = self._create_weights_from_disk_simulation(model)
-        loader.load_weights_and_postprocess(model, weights, self.device)
-        self._assert_flashrl_state_initialized(model)
+        try:
+            model = loader.load_model(
+                model_config=self._create_mock_model_config(),
+                device_config=device_config,
+            )
+            self._assert_flashrl_state_initialized(model)
+        finally:
+            loader_module._initialize_model = original_initialize_model
 
         # Reset FlashRL state
-        reset_result = self.QuantizedRLModelLoader.quantized_rl_reset_state(model)
+        reset_result = loader.quantized_rl_reset_state(model)
         self.assertTrue(reset_result, "Reset should return True for initialized model")
 
-        # Load weights again (should trigger re-initialization)
+        # Load weights again - should re-initialize FlashRL state
         new_weights = self._create_updated_weights_simulation(model, update_id=999)
-        loader.load_weights_and_postprocess(model, new_weights, self.device)
-
-        # Verify FlashRL state was re-established
+        model.load_weights(new_weights)
         self._assert_flashrl_state_initialized(model)
+
+        # Verify subsequent updates still work after reset
+        post_reset_state = self._capture_model_state(model)
+        final_weights = self._create_updated_weights_simulation(model, update_id=1000)
+        model.load_weights(final_weights)
+        self._assert_flashrl_state_preserved(model)
+        self._assert_weights_changed(model, post_reset_state, "post-reset update")
 
     # Helper methods to reduce code duplication
 
@@ -170,13 +171,6 @@ class TestQuantizedRLLoaderIntegration(CustomTestCase):
             device=self.device,
         )
         return model
-
-    def _initialize_model_with_flashrl(self, model: nn.Module) -> None:
-        """Initialize model with FlashRL state using first load."""
-        load_config = self.LoadConfig(load_format=self.LoadFormat.FLASHRL)
-        loader = self.get_model_loader(load_config)
-        initial_weights = self._create_weights_from_disk_simulation(model)
-        loader.load_weights_and_postprocess(model, initial_weights, self.device)
 
     def _create_weights_from_disk_simulation(
         self, model: nn.Module
@@ -319,15 +313,14 @@ class MockQuantMethod:
 
 
 def main():
-    """Run the QuantizedRLModelLoader integration tests."""
-    print("Testing QuantizedRLModelLoader Integration with SGLang Configuration")
-    print("=" * 70)
-    print("This test verifies:")
-    print("1. LoadFormat.FLASHRL correctly routes to QuantizedRLModelLoader")
-    print("2. Complete model loading workflow using FLASHRL configuration")
-    print("3. Weight updates through the proper model loader pipeline")
-    print("4. FlashRL state management and reset functionality")
-    print("=" * 70)
+    """Run focused QuantizedRLModelLoader integration tests."""
+    print("Testing QuantizedRLModelLoader Integration")
+    print("=" * 45)
+    print("Focused tests covering:")
+    print("• Complete workflow: config → loader → model loading → weight updates")
+    print("• FlashRL state management and reset functionality")
+    print("• Automatic model.load_weights override in real workflows")
+    print("=" * 45)
 
     # Run tests
     import unittest
