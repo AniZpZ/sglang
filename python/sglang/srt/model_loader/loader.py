@@ -563,7 +563,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             logger.debug(
                 "process_weights_after_loading already called for model %s", model
             )
-            return True  # Return True to indicate already initialized
+            return
 
         # Save original weight state for potential reloading
         if not hasattr(model, "original_weights_rebuild_keys"):
@@ -599,7 +599,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     else:
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
-        return False  # Return False to indicate initialization just completed
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):

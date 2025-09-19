@@ -1106,13 +1106,6 @@ class ServerArgs:
             help="Disable the hybrid SWA memory.",
         )
 
-        # Quantized RL support
-        parser.add_argument(
-            "--enable-quantized-rl",
-            action="store_true",
-            help="Enable quantized reinforcement learning support for proper parameter updates in quantized models.",
-        )
-
         # Runtime options
         parser.add_argument(
             "--device",
