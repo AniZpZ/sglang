@@ -490,6 +490,74 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+
+class QuantizedRLModelLoader(DefaultModelLoader):
+    """Model loader with FlashRL-specific functionality for advanced weight management."""
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Patch the load_weights by loading model and override its load_weights method with quantized RL logic."""
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+        # Simply override the load_weights method - much cleaner!
+        original_load_weights = model.load_weights
+
+        def quantized_rl_load_weights(weights):
+            return QuantizedRLModelLoader.quantized_rl_load_weights(
+                model, weights, original_load_weights
+            )
+
+        model.load_weights = quantized_rl_load_weights
+        logger.info(
+            "QuantizedRLModelLoader: Overrode model.load_weights with quantized RL logic"
+        )
+
+        # Load weights using our custom load_weights_and_postprocess
+        self.load_weights_and_postprocess(
+            model, self._get_all_weights(model_config, model), target_device
+        )
+
+        return model.eval()
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    ):
+        """Override to handle LoadFormat.FLASHRL by treating it as AUTO."""
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
+        # FLASHRL uses the same weight loading as AUTO, difference is in processing
+        temp_config = LoadConfig(load_format=LoadFormat.AUTO)
+        temp_loader = DefaultModelLoader(temp_config)
+        return temp_loader._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt
+        )
+
+    @staticmethod
+    def _initialize_flashrl_state(model):
+        """Initialize FlashRL-specific state for the model."""
         # Check if already called to prevent duplicate processing
         if getattr(model, "process_weights_after_loading_already_called", False):
             logger.debug(
@@ -532,10 +600,12 @@ class DefaultModelLoader(BaseModelLoader):
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
-        # Load weights first
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        # Load weights using the overridden model.load_weights method
         model.load_weights(weights)
 
-        # Process weights after loading (quantization, etc.)
+        # Handle quantization postprocessing
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -547,40 +617,40 @@ class DefaultModelLoader(BaseModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        # Mark as already called to prevent duplicate processing
-        model.process_weights_after_loading_already_called = True
-
     @staticmethod
     def reset_model_weights_state(model):
         """Reset the model's weight state to allow re-quantization."""
+        if not hasattr(model, "original_weights_rebuild_keys"):
+            logger.warning("No quantized RL state to reset - model not initialized")
+            return
+
         model.process_weights_after_loading_already_called = False
 
         # Restore original weight state if available
-        if hasattr(model, "original_weights_rebuild_keys"):
-            for name, rebuild_info in model.original_weights_rebuild_keys.items():
-                if hasattr(model, name):
-                    param = getattr(model, name)
-                    if param is not None:
-                        # Create new tensor with original shape and dtype
-                        # Note: This is a simplified reset - in practice, you might need
-                        # to handle more complex cases like quantized parameters
-                        try:
-                            new_data = torch.empty(
-                                rebuild_info["shape"],
-                                dtype=rebuild_info["dtype"],
-                                device=param.device,
-                            )
-                            param.data = new_data
-                        except Exception as e:
-                            logger.warning(f"Failed to reset parameter {name}: {e}")
-                            # Continue with other parameters
-                            continue
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+            if hasattr(model, name):
+                param = getattr(model, name)
+                if param is not None:
+                    # Create new tensor with original shape and dtype
+                    # Note: This is a simplified reset - in practice, you might need
+                    # to handle more complex cases like quantized parameters
+                    try:
+                        new_data = torch.empty(
+                            rebuild_info["shape"],
+                            dtype=rebuild_info["dtype"],
+                            device=param.device,
+                        )
+                        param.data = new_data
+                    except Exception as e:
+                        logger.warning(f"Failed to reset parameter {name}: {e}")
+                        # Continue with other parameters
+                        continue
 
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
-        DefaultModelLoader.reset_model_weights_state(model)
+        QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
         for _, module in model.named_modules():
@@ -648,8 +718,9 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 original_param_dict[name].copy_(strided_data)
 
-            del p.data
-            p.data = original_param_dict[name]
+            # Use copy_ instead of deleting and reassigning data
+            # This is compatible with newer PyTorch versions
+            p.data.copy_(original_param_dict[name])
 
         del original_param_dict
         del existing_params
@@ -663,6 +734,62 @@ class DefaultModelLoader(BaseModelLoader):
                 delattr(module, "preserved_workspace")
 
         return updated_params
+
+    @staticmethod
+    def quantized_rl_load_weights(model, weights, original_load_weights_fn):
+        """
+        Load weights with quantized RL-aware state management.
+
+        This method automatically handles first-time initialization and subsequent
+        weight updates for quantized reinforcement learning models, ensuring proper
+        parameter rebinding after quantization operations.
+
+        Args:
+            model: The model to load weights into
+            weights: Iterator of (name, tensor) pairs
+            original_load_weights_fn: The original model.load_weights function
+
+        Returns:
+            Updated parameters set (for subsequent loads) or None (for first load)
+        """
+        # Check if this is the first time loading weights
+        first_time_load = not hasattr(model, "original_weights_rebuild_keys")
+
+        if first_time_load:
+            # First time loading - use standard process but initialize FlashRL state
+            result = original_load_weights_fn(weights)
+            QuantizedRLModelLoader._initialize_flashrl_state(model)
+            # Mark as initialized to prevent duplicate processing
+            model.process_weights_after_loading_already_called = True
+            return result
+        else:
+            # Subsequent loading - use FlashRL rebinding process
+            def first_time_load_weights(weights_iter):
+                return original_load_weights_fn(weights_iter)
+
+            return QuantizedRLModelLoader.rebinding_and_load_weights(
+                model, first_time_load_weights, weights
+            )
+
+    @staticmethod
+    def quantized_rl_reset_state(model):
+        """
+        Reset quantized RL state for model parameter reloading.
+
+        This method safely resets the quantized RL state if it exists, allowing
+        for clean reinitialization of the model's quantization parameters.
+
+        Args:
+            model: The model to reset state for
+
+        Returns:
+            bool: True if state was reset, False if no state existed
+        """
+        if hasattr(model, "original_weights_rebuild_keys"):
+            QuantizedRLModelLoader.reset_model_weights_state(model)
+            return True
+        else:
+            return False
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1744,5 +1871,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.FLASHRL:
+        return QuantizedRLModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

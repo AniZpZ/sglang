@@ -95,7 +95,11 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    QuantizedRLModelLoader,
+    get_model_loader,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
@@ -803,9 +807,9 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # Only support DefaultModelLoader for now
+        # Support DefaultModelLoader and QuantizedRLModelLoader for now
         loader = get_model_loader(load_config)
-        if not isinstance(loader, DefaultModelLoader):
+        if not isinstance(loader, (DefaultModelLoader, QuantizedRLModelLoader)):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
@@ -816,7 +820,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -995,8 +999,7 @@ class ModelRunner:
             flattened_tensor=flattened_tensor, metadata=converted_metadata
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
-
-        # Load the reconstructed tensors using the standard method
+        # Load the reconstructed tensors based on model loader
         self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"

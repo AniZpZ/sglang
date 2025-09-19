@@ -153,9 +153,23 @@ python3 -m sglang.launch_server \
 
 ## FP8 Rollout
 
+### Background & Motivation
+
+FP8 rollout addresses a specific challenge in reinforcement learning (RL) training with quantized models: **efficient weight synchronization between training and inference engines**. In RL frameworks like FlashRL, the inference engine generates rollouts with quantized models, while training engines compute gradients and update parameters. Updated parameters must be frequently synchronized back to the quantized inference engine without triggering expensive re-quantization every time.
+
+**Key challenges:**
+- **Mixed precision workflows**: Load BF16 weights, shard across devices, then quantize online to FP8
+- **Frequent updates**: RL training requires multiple weight synchronizations per iteration
+- **State preservation**: FP8 quantization creates scaling factors and metadata that must persist across updates
+- **Memory efficiency**: Avoid redundant quantization operations and maintain tensor memory locations for optimized CUDA kernels
+
+### Solution
+
+SGLang provides loader-level controls for efficient FP8 rollout without modifying quantization methods. The loader manages quantization state and supports both fast reloading (skip re-quantization) and explicit re-quantization when needed.
+
 When rolling out FP8 online quantization incrementally (e.g., load BF16 weights first, shard then quantize online to FP8), you may need to reload weights multiple times without re-quantizing every time.
 
-SGLang provides loader-level controls so you don't need to change quantization methods (e.g., `Fp8LinearMethod`). The loader manages state to avoid duplicate quantization and allows forcing re-quantization when needed.
+**FlashRL Integration:** Use `export FLASHRL_CONFIG=fp8` and `actor_rollout_ref.rollout.load_format=flashrl` for seamless RL training with up to 2x memory reduction.
 
 ### Why loader-level control?
 - Keep quantization layers stateless/simple; avoid coupling to load timing.
@@ -163,12 +177,12 @@ SGLang provides loader-level controls so you don't need to change quantization m
 - Support both: fast reloading (skip re-quantization) and explicit re-quantization.
 
 ### APIs
-- `DefaultModelLoader.load_weights_and_postprocess(model, weights, target_device)`
-  - First call: loads weights and invokes `quant_method.process_weights_after_loading` once.
+- `QuantizedRLModelLoader.load_weights_and_postprocess(model, weights, target_device)`
+  - First call: initializes FlashRL state, loads weights and invokes `quant_method.process_weights_after_loading` once.
   - Subsequent calls: skipped by default (no duplicate quantization).
-- `DefaultModelLoader.reset_model_weights_state(model)`
+- `QuantizedRLModelLoader.reset_model_weights_state(model)`
   - Clears the internal "already processed" flag and restores parameter shapes/dtypes so you can force re-quantization next time.
-- `DefaultModelLoader.rebinding_and_load_weights(model, first_time_load_weights, weights)`
+- `QuantizedRLModelLoader.rebinding_and_load_weights(model, first_time_load_weights, weights)`
   - Full rebinding flow for complex reload (re-attach weight loaders, rebuild param storage, re-run postprocess) with state preservation.
 
 ### Typical usage
@@ -177,24 +191,24 @@ SGLang provides loader-level controls so you don't need to change quantization m
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.loader import QuantizedRLModelLoader
 
 # 1) Initial load (BF16 -> FP8 after TP sharding)
 model_config = ModelConfig(model_path="<your_model>")
 device_config = DeviceConfig(device="cuda:0")
 load_config = LoadConfig(load_format="auto")
-loader = DefaultModelLoader(load_config)
+loader = QuantizedRLModelLoader(load_config)
 model = loader.load_model(model_config=model_config, device_config=device_config)
-# Internally: weights loaded -> process_weights_after_loading called once
+# Internally: FlashRL state initialized -> weights loaded -> process_weights_after_loading called once
 
 # 2) Reload weights later without re-quantization (fast path)
 new_weights = ...  # obtain your weights dict/iterator
-DefaultModelLoader.load_weights_and_postprocess(model, new_weights, target_device=None)
+QuantizedRLModelLoader.load_weights_and_postprocess(model, new_weights, target_device=None)
 # Skips duplicate quantization automatically
 
 # 3) Force re-quantization (e.g., quant config changed or you want fresh FP8)
-DefaultModelLoader.reset_model_weights_state(model)
-DefaultModelLoader.load_weights_and_postprocess(model, new_weights, target_device=None)
+QuantizedRLModelLoader.reset_model_weights_state(model)
+QuantizedRLModelLoader.load_weights_and_postprocess(model, new_weights, target_device=None)
 # Now process_weights_after_loading is invoked again
 ```
 
@@ -209,17 +223,21 @@ def custom_load_weights(weights):
     return set(model.state_dict().keys())
 
 try:
-    updated_params = DefaultModelLoader.rebinding_and_load_weights(
+    updated_params = QuantizedRLModelLoader.rebinding_and_load_weights(
         model, custom_load_weights, new_weights
     )
 except Exception as e:
     print(f"Rebinding failed: {e}")
     # Fallback to simple reload
-    DefaultModelLoader.reset_model_weights_state(model)
-    DefaultModelLoader.load_weights_and_postprocess(model, new_weights, None)
+    QuantizedRLModelLoader.reset_model_weights_state(model)
+    QuantizedRLModelLoader.load_weights_and_postprocess(model, new_weights, None)
 ```
 
 ### Notes
 - By default, repeated calls won’t re-quantize; use `reset_model_weights_state` to re-enable quantization explicitly.
 - Loader handles temporary device moves for post-processing (e.g., CPU offload → GPU) through its device context.
 - This works with both standard dense layers and MoE layers that have FP8 quantization methods.
+
+### Reference
+
+- [FP8 Rollout](https://github.com/yaof20/Flash-RL/blob/main/tutorial/README.md)
