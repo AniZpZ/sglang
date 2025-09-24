@@ -551,94 +551,94 @@ class Qwen2ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    """
-        TODO: change this to the new load_weights
-    def custom_load_weights(weights):
-            # Your customized loading routine, which is the original qwen2 load_weights
-            model.load_weights(weights)
-            # Return a set of updated parameter names (optional contract)
-            return set(model.state_dict().keys())
-
-        try:
-            updated_params = QuantizedRLModelLoader.rebinding_and_load_weights(
-                model, custom_load_weights, new_weights
-            )
-        except Exception as e:
-            print(f"Rebinding failed: {e}")
-            # Fallback to simple reload
-            QuantizedRLModelLoader.reset_model_weights_state(model)
-            QuantizedRLModelLoader.load_weights_and_postprocess(model, new_weights, None). NOTE: ONLY CHANGE THE loads_weights, only change other function if necessary
-
-    """
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        def custom_load_weights(weights):
+            """Original qwen2 load_weights implementation"""
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
 
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                    # Handle pp weight tying here
-                    # find the embed_tokens.weight in the weights
-                    embed_token_weights = next(
-                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
-                    )[1]
-                    loaded_weight = embed_token_weights
-                else:
-                    continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+            params_dict = dict(self.named_parameters())
+            updated_param_names = set()
+            
+            for name, loaded_weight in weights:
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
                     )
-                    weight_loader(param, loaded_weight)
+                ):
+                    continue
+
+                if "rotary_emb.inv_freq" in name or "projector" in name:
+                    continue
+                if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                    # Models trained using ColossalAI may include these tensors in
+                    # the checkpoint. Skip them.
+                    continue
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+                        # Handle pp weight tying here
+                        # find the embed_tokens.weight in the weights
+                        embed_token_weights = next(
+                            filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
+                        )[1]
+                        loaded_weight = embed_token_weights
+                    else:
+                        continue
+                if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
+
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    updated_param_names.add(name)
+                    break
                 else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        updated_param_names.add(name)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+            
+            return updated_param_names
+
+        # Try to use QuantizedRLModelLoader for advanced weight management
+        try:
+            from sglang.srt.model_loader.loader import QuantizedRLModelLoader
+            updated_params = QuantizedRLModelLoader.rebinding_and_load_weights(
+                self, custom_load_weights, weights
+            )
+            return updated_params
+        except (ImportError, Exception) as e:
+            logger.debug(f"QuantizedRLModelLoader not available or rebinding failed: {e}")
+            # Fallback to original load_weights implementation
+            return custom_load_weights(weights)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

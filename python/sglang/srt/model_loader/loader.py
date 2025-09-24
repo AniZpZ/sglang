@@ -583,7 +583,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Mark as already called to prevent duplicate processing
         model.process_weights_after_loading_already_called = True
 
-       @staticmethod
+    @staticmethod
     def reset_model_weights_state(model):
         """Reset the model's weight state to allow re-quantization."""
         model.process_weights_after_loading_already_called = False
@@ -609,11 +609,11 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             # Continue with other parameters
                             continue
 
-     @staticmethod
+    @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
-        DefaultModelLoader.reset_model_weights_state(model)
+        QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
         for _, module in model.named_modules():
@@ -697,8 +697,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 delattr(module, "preserved_workspace")
 
         return updated_params
-
- 
 
 
 class LayeredModelLoader(DefaultModelLoader):
