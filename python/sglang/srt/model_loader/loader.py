@@ -583,34 +583,31 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Mark as already called to prevent duplicate processing
         model.process_weights_after_loading_already_called = True
 
-    @staticmethod
+       @staticmethod
     def reset_model_weights_state(model):
         """Reset the model's weight state to allow re-quantization."""
-        if not hasattr(model, "original_weights_rebuild_keys"):
-            logger.warning("No quantized RL state to reset - model not initialized")
-            return
-
         model.process_weights_after_loading_already_called = False
 
         # Restore original weight state if available
-        for name, rebuild_info in model.original_weights_rebuild_keys.items():
-            if hasattr(model, name):
-                param = getattr(model, name)
-                if param is not None:
-                    # Create new tensor with original shape and dtype
-                    # Note: This is a simplified reset - in practice, you might need
-                    # to handle more complex cases like quantized parameters
-                    try:
-                        new_data = torch.empty(
-                            rebuild_info["shape"],
-                            dtype=rebuild_info["dtype"],
-                            device=param.device,
-                        )
-                        param.data = new_data
-                    except Exception as e:
-                        logger.warning(f"Failed to reset parameter {name}: {e}")
-                        # Continue with other parameters
-                        continue
+        if hasattr(model, "original_weights_rebuild_keys"):
+            for name, rebuild_info in model.original_weights_rebuild_keys.items():
+                if hasattr(model, name):
+                    param = getattr(model, name)
+                    if param is not None:
+                        # Create new tensor with original shape and dtype
+                        # Note: This is a simplified reset - in practice, you might need
+                        # to handle more complex cases like quantized parameters
+                        try:
+                            new_data = torch.empty(
+                                rebuild_info["shape"],
+                                dtype=rebuild_info["dtype"],
+                                device=param.device,
+                            )
+                            param.data = new_data
+                        except Exception as e:
+                            logger.warning(f"Failed to reset parameter {name}: {e}")
+                            # Continue with other parameters
+                            continue
 
      @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
