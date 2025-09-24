@@ -735,61 +735,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         return updated_params
 
-    @staticmethod
-    def quantized_rl_load_weights(model, weights, original_load_weights_fn):
-        """
-        Load weights with quantized RL-aware state management.
-
-        This method automatically handles first-time initialization and subsequent
-        weight updates for quantized reinforcement learning models, ensuring proper
-        parameter rebinding after quantization operations.
-
-        Args:
-            model: The model to load weights into
-            weights: Iterator of (name, tensor) pairs
-            original_load_weights_fn: The original model.load_weights function
-
-        Returns:
-            Updated parameters set (for subsequent loads) or None (for first load)
-        """
-        # Check if this is the first time loading weights
-        first_time_load = not hasattr(model, "original_weights_rebuild_keys")
-
-        if first_time_load:
-            # First time loading - use standard process but initialize FlashRL state
-            result = original_load_weights_fn(weights)
-            QuantizedRLModelLoader._initialize_flashrl_state(model)
-            # Mark as initialized to prevent duplicate processing
-            model.process_weights_after_loading_already_called = True
-            return result
-        else:
-            # Subsequent loading - use FlashRL rebinding process
-            def first_time_load_weights(weights_iter):
-                return original_load_weights_fn(weights_iter)
-
-            return QuantizedRLModelLoader.rebinding_and_load_weights(
-                model, first_time_load_weights, weights
-            )
-
-    @staticmethod
-    def quantized_rl_reset_state(model):
-        """
-        Reset quantized RL state for model parameter reloading.
-
-        This method safely resets the quantized RL state if it exists, allowing
-        for clean reinitialization of the model's quantization parameters.
-
-        Args:
-            model: The model to reset state for
-
-        Returns:
-            bool: True if state was reset, False if no state existed
-        """
-        if hasattr(model, "original_weights_rebuild_keys"):
-            QuantizedRLModelLoader.reset_model_weights_state(model)
-            return True
-        else:
-            return False
+ 
 
 
 class LayeredModelLoader(DefaultModelLoader):
