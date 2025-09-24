@@ -686,81 +686,35 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         for name, p in existing_params.items():
             original_param_dict[name] = p.data
 
-        # Reset parameters to their original unquantized state
-        logger.info("[QuantizedRL] Resetting parameters to original state")
+        # Recover the parameter to the state before first loading
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in existing_params:
-                param = existing_params[name]
-                # Create new empty tensor with original shape and dtype
-                new_data = torch.empty(
+                existing_params[name].data = torch.empty(
                     rebuild_info["shape"],
                     dtype=rebuild_info["dtype"],
-                    device=param.device,
+                    device=existing_params[name].device,
                 )
-                param.data = new_data
-                logger.debug(f"[QuantizedRL] Reset parameter {name} to shape {rebuild_info['shape']}")
 
-        # Restore weight loaders with better error handling
-        logger.info("[QuantizedRL] Restoring weight loaders")
-        total_recorded = sum(len(loader_k) for loader_k in model.recorded_loader.values())
-        logger.info(f"[QuantizedRL] Starting restoration with {total_recorded} recorded loaders")
-        
-        restoration_stats = {}
-        for loader_type, loader_dict in model.recorded_loader.items():
-            restoration_stats[loader_type] = {"restored": 0, "missing": 0}
-            
-            for param_name, loader in loader_dict.items():
-                if param_name in existing_params:
-                    try:
-                        param = existing_params[param_name]
-                        bound_loader = QuantizedRLModelLoader._bond_method_to_cls(loader, param)
-                        setattr(param, loader_type, bound_loader)
-                        restoration_stats[loader_type]["restored"] += 1
-                        logger.debug(f"[QuantizedRL] Restored '{loader_type}' for parameter '{param_name}'")
-                    except Exception as e:
-                        logger.error(f"[QuantizedRL] Failed to restore '{loader_type}' for '{param_name}': {e}")
-                        restoration_stats[loader_type]["missing"] += 1
-                else:
-                    restoration_stats[loader_type]["missing"] += 1
-                    logger.debug(f"[QuantizedRL] Parameter '{param_name}' not found for '{loader_type}'")
+        # Restore weight loaders
+        for k, loader_k in model.recorded_loader.items():
+            for n, loader in loader_k.items():
+                if not hasattr(existing_params[n], k):
+                    # Simple binding for now - in a full implementation you might need
+                    # a more sophisticated binding mechanism
+                    setattr(existing_params[n], k, loader)
 
-        # Log restoration statistics
-        for loader_type, stats in restoration_stats.items():
-            logger.info(f"[QuantizedRL] '{loader_type}': {stats['restored']} restored, {stats['missing']} missing")
+        # After recovering, the weight loading can be called as usual
+        updated_params = first_time_load_weights(weights)
 
-        # Validate weight loader restoration
-        validation_count = 0
-        for param_name, param in existing_params.items():
-            if hasattr(param, 'weight_loader') and callable(param.weight_loader):
-                validation_count += 1
-        logger.info(f"[QuantizedRL] Validation: {validation_count}/{len(existing_params)} parameters have functional weight_loader")
-
-        # Load weights using the restored loaders
-        logger.info("[QuantizedRL] Loading weights with restored loaders")
-        try:
-            updated_params = first_time_load_weights(weights)
-            logger.info(f"[QuantizedRL] Successfully loaded weights, updated {len(updated_params)} parameters")
-        except Exception as e:
-            logger.error(f"[QuantizedRL] Failed to load weights: {e}")
-            raise
-
-        # Process weights after loading (quantization, etc.)
-        logger.info("[QuantizedRL] Processing weights after loading")
-        try:
-            target_device = next(model.parameters()).device
-        except StopIteration:
-            logger.warning("[QuantizedRL] No parameters found in model, using cuda:0")
-            target_device = torch.device("cuda:0")
-            
+        # Manually conducting process weights after loading
+        # Note: We don't need to call load_weights_and_postprocess here because
+        # first_time_load_weights already loaded the weights, we just need to process them
+        target_device = next(model.parameters()).device
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                try:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-                except Exception as e:
-                    logger.error(f"[QuantizedRL] Failed to process weights for module: {e}")
-                    raise
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
 
         # Mark as processed
         model.process_weights_after_loading_already_called = True
