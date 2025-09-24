@@ -507,40 +507,6 @@ class DefaultModelLoader(BaseModelLoader):
 class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        """Patch the load_weights by loading model and override its load_weights method with quantized RL logic."""
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
-
-        # Simply override the load_weights method - much cleaner!
-        original_load_weights = model.load_weights
-
-        def quantized_rl_load_weights(weights):
-            return QuantizedRLModelLoader.quantized_rl_load_weights(
-                model, weights, original_load_weights
-            )
-
-        model.load_weights = quantized_rl_load_weights
-        logger.info(
-            "QuantizedRLModelLoader: Overrode model.load_weights with quantized RL logic"
-        )
-
-        # Load weights using our custom load_weights_and_postprocess
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
-
-        return model.eval()
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
@@ -556,8 +522,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         )
 
     @staticmethod
-    def _initialize_flashrl_state(model):
-        """Initialize FlashRL-specific state for the model."""
+    def load_weights_and_postprocess(model, weights, target_device):
         # Check if already called to prevent duplicate processing
         if getattr(model, "process_weights_after_loading_already_called", False):
             logger.debug(
@@ -600,12 +565,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
-    @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
-        # Load weights using the overridden model.load_weights method
+        # Load weights first
         model.load_weights(weights)
 
-        # Handle quantization postprocessing
+        # Process weights after loading (quantization, etc.)
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -616,6 +579,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        # Mark as already called to prevent duplicate processing
+        model.process_weights_after_loading_already_called = True
 
     @staticmethod
     def reset_model_weights_state(model):
@@ -646,11 +612,11 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         # Continue with other parameters
                         continue
 
-    @staticmethod
+     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
-        QuantizedRLModelLoader.reset_model_weights_state(model)
+        DefaultModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
         for _, module in model.named_modules():
