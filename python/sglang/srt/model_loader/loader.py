@@ -784,15 +784,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         del current_params
         gc.collect()
 
-        # Restore preserved workspaces
-        for module_name, module in model.named_modules():
-            if module_name in preserved_workspaces:
-                setattr(module, "workspace", preserved_workspaces[module_name])
+        # Restore workspace
+        for _, module in model.named_modules():
+            if torch.is_tensor(getattr(module, "workspace", None)):
+                setattr(module, "workspace", getattr(module, "preserved_workspace"))
+                delattr(module, "preserved_workspace")
 
-        # Force memory cleanup to avoid OOM issues
-        torch.cuda.empty_cache()
-        
-        logger.info(f"[QuantizedRL] Weight rebinding completed successfully")
         return updated_params
 
 
