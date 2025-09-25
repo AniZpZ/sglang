@@ -681,9 +681,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 )
                 original_param_dict[name].copy_(strided_data)
 
-            # Use copy_ instead of deleting and reassigning data
-            # This is compatible with newer PyTorch versions
-            p.data.copy_(original_param_dict[name])
+            # Swap to the original tensor (which now has updated data if needed)
+            p.data = original_param_dict[name]
+
 
         del original_param_dict
         del existing_params
