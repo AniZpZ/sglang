@@ -177,12 +177,36 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
-        return output
+        # Check for potential memory issues
+        if not hidden_states.is_contiguous():
+            logger.warning(f"[QWEN2_ATTN] Hidden states not contiguous: {hidden_states.shape}")
+        if not positions.is_contiguous():
+            logger.warning(f"[QWEN2_ATTN] Positions not contiguous: {positions.shape}")
+        
+        try:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            
+            try:
+                q, k = self.rotary_emb(positions, q, k)
+            except Exception as e:
+                logger.error(f"[QWEN2_ATTN] Rotary embedding failed: {e}")
+                logger.error(f"[QWEN2_ATTN] Inputs - positions: {positions.shape} {positions.device}, q: {q.shape} {q.device}, k: {k.shape} {k.device}")
+                raise
+            
+            try:
+                attn_output = self.attn(q, k, v, forward_batch)
+            except Exception as e:
+                logger.error(f"[QWEN2_ATTN] Attention computation failed: {e}")
+                logger.error(f"[QWEN2_ATTN] QKV shapes - q: {q.shape}, k: {k.shape}, v: {v.shape}")
+                raise
+            
+            output, _ = self.o_proj(attn_output)
+            return output
+            
+        except Exception as e:
+            logger.error(f"[QWEN2_ATTN] Attention forward failed: {type(e).__name__}: {e}")
+            raise
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -628,15 +652,21 @@ class Qwen2ForCausalLM(nn.Module):
             
             return updated_param_names
 
-        # Try to use QuantizedRLModelLoader for advanced weight management
+        # Check if this is a reload scenario for QuantizedRLModelLoader
         try:
             from sglang.srt.model_loader.loader import QuantizedRLModelLoader
-            updated_params = QuantizedRLModelLoader.rebinding_and_load_weights(
-                self, custom_load_weights, weights
-            )
-            return updated_params
+            
+            if QuantizedRLModelLoader.is_reload_scenario(self):
+                # This is a true reload: use rebinding for efficient weight swapping
+                return QuantizedRLModelLoader.rebinding_and_load_weights(
+                    self, custom_load_weights, weights
+                )
+            else:
+                # First load or loader is setting up: use standard loading
+                return custom_load_weights(weights)
+                
         except (ImportError, Exception) as e:
-            logger.warning(f"QuantizedRLModelLoader not available or rebinding failed: {e}")
+            logger.warning(f"[QuantizedRL] QuantizedRLModelLoader not available or failed: {e}")
             # Fallback to original load_weights implementation
             return custom_load_weights(weights)
 

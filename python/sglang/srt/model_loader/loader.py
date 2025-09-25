@@ -525,10 +525,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     def load_weights_and_postprocess(model, weights, target_device):
         # Check if already called to prevent duplicate processing
         if getattr(model, "process_weights_after_loading_already_called", False):
-            logger.debug(
-                "process_weights_after_loading already called for model %s", model
+            logger.warning(
+                "[QuantizedRL] process_weights_after_loading already called for model %s", model
             )
             return
+
+        # Mark that we're in the initial loading phase
+        model._quantized_rl_initial_loading = True
 
         # Save original weight state for potential reloading
         if not hasattr(model, "original_weights_rebuild_keys"):
@@ -582,6 +585,19 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         # Mark as already called to prevent duplicate processing
         model.process_weights_after_loading_already_called = True
+        
+        # Clear the initial loading flag
+        if hasattr(model, "_quantized_rl_initial_loading"):
+            delattr(model, "_quantized_rl_initial_loading")
+
+    @staticmethod
+    def is_reload_scenario(model):
+        """Check if this is a true reload scenario (not initial loading)."""
+        return (
+            hasattr(model, "original_weights_rebuild_keys") and 
+            getattr(model, "process_weights_after_loading_already_called", False) and
+            not getattr(model, "_quantized_rl_initial_loading", False)
+        )
 
     @staticmethod
     def reset_model_weights_state(model):
@@ -674,15 +690,57 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             ), f"param {name} numel() mismatch: {original_param_dict[name].numel()} vs {p.data.numel()}"
 
             if name in updated_params:
-                strided_data = torch.as_strided(
-                    p.data,
-                    original_param_dict[name].shape,
-                    original_param_dict[name].stride(),
-                )
-                original_param_dict[name].copy_(strided_data)
+                # Check for potential memory layout issues before using as_strided
+                original_tensor = original_param_dict[name]
+                current_tensor = p.data
+                
+                # Warn if tensors are not contiguous
+                if not current_tensor.is_contiguous():
+                    logger.warning(f"[QuantizedRL] Current tensor {name} is not contiguous")
+                if not original_tensor.is_contiguous():
+                    logger.warning(f"[QuantizedRL] Original tensor {name} is not contiguous")
+                
+                # Check for device mismatch
+                if current_tensor.device != original_tensor.device:
+                    logger.warning(f"[QuantizedRL] Device mismatch for {name}: {current_tensor.device} vs {original_tensor.device}")
+                
+                # Validate stride compatibility
+                original_shape = original_tensor.shape
+                original_stride = original_tensor.stride()
+                
+                try:
+                    # Check if the stride pattern makes sense for the tensor size
+                    max_offset = 0
+                    for dim_size, stride in zip(original_shape, original_stride):
+                        if dim_size > 1:  # Only check non-singleton dimensions
+                            max_offset = max(max_offset, (dim_size - 1) * stride)
+                    
+                    if max_offset >= current_tensor.numel():
+                        logger.warning(f"[QuantizedRL] Potentially unsafe stride pattern for {name}: max_offset={max_offset}, tensor_size={current_tensor.numel()}")
+                    
+                    strided_data = torch.as_strided(
+                        current_tensor,
+                        original_shape,
+                        original_stride,
+                    )
+                    
+                    # Validate the strided view
+                    if strided_data.numel() != original_tensor.numel():
+                        logger.warning(f"[QuantizedRL] Strided view size mismatch for {name}: {strided_data.numel()} vs {original_tensor.numel()}")
+                    
+                    original_tensor.copy_(strided_data)
+                    
+                except Exception as e:
+                    logger.error(f"[QuantizedRL] Failed to create strided view for {name}: {e}")
+                    logger.error(f"[QuantizedRL] Tensor shapes - current: {current_tensor.shape}, original: {original_shape}")
+                    logger.error(f"[QuantizedRL] Tensor strides - original: {original_stride}")
+                    raise
 
             # Swap to the original tensor (which now has updated data if needed)
             p.data = original_param_dict[name]
+
+
+
 
 
         del original_param_dict
