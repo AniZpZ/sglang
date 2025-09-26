@@ -657,11 +657,13 @@ class Qwen2ForCausalLM(nn.Module):
             from sglang.srt.model_loader.loader import QuantizedRLModelLoader
             
             if QuantizedRLModelLoader.is_reload_scenario(self):
+                logger.info("[QuantizedRL]: use rebinding for efficient weight swapping")
                 # This is a true reload: use rebinding for efficient weight swapping
                 return QuantizedRLModelLoader.rebinding_and_load_weights(
                     self, custom_load_weights, weights
                 )
             else:
+                logger.info("[QuantizedRL]: use standard loading")
                 # First load or loader is setting up: use standard loading
                 return custom_load_weights(weights)
                 
