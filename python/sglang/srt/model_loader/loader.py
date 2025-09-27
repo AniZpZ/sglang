@@ -674,14 +674,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
-        preserved_workspaces = {}
-        for module_name, module in model.named_modules():
+        for _, module in model.named_modules():
             if torch.is_tensor(getattr(module, "workspace", None)):
-                preserved_workspaces[module_name] = getattr(module, "workspace")
+                setattr(module, "preserved_workspace", getattr(module, "workspace"))
 
         existing_params = dict(model.named_parameters())
 
-        # Preserve original data - create a mapping of parameter data
+        # Preserve original data, so that after parameter loading, we can put the parameter
+        # in the original tensor
         original_param_dict = {}
         for name, p in existing_params.items():
             original_param_dict[name] = p.data
@@ -716,72 +716,34 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        # Mark as processed
+        # Mark as already called
         model.process_weights_after_loading_already_called = True
 
-        # Restore parameter data to original tensors with improved handling
-        logger.info("[QuantizedRL] Restoring parameter data to original tensors")
-        current_params = dict(model.named_parameters())
-        
-        for name, current_param in current_params.items():
-            if name not in original_param_dict:
-                logger.warning(f"[QuantizedRL] New parameter '{name}' found after loading")
-                continue
-                
-            original_tensor = original_param_dict[name]
-            current_tensor = current_param.data
-            
-            # Validate tensor compatibility
-            if original_tensor.dtype != current_tensor.dtype:
-                logger.error(f"[QuantizedRL] Dtype mismatch for {name}: {original_tensor.dtype} vs {current_tensor.dtype}")
-                continue
-                
-            if original_tensor.numel() != current_tensor.numel():
-                logger.error(f"[QuantizedRL] Size mismatch for {name}: {original_tensor.numel()} vs {current_tensor.numel()}")
-                continue
+        # Put the value of the newly created tensor to the original tensor
+        for name, p in model.named_parameters():
+            assert (
+                name in original_param_dict
+            ), f"param {name} is not in original_param_dict"
+            assert (
+                original_param_dict[name].dtype == p.data.dtype
+            ), f"param {name} dtype mismatch: {original_param_dict[name].dtype} vs {p.data.dtype}"
+            assert (
+                original_param_dict[name].numel() == p.data.numel()
+            ), f"param {name} numel() mismatch: {original_param_dict[name].numel()} vs {p.data.numel()}"
 
-            # Handle parameter restoration based on whether it was updated
             if name in updated_params:
-                try:
-                    # For updated parameters, we need to copy the new data back
-                    if original_tensor.shape == current_tensor.shape:
-                        # Direct copy if shapes match
-                        original_tensor.copy_(current_tensor)
-                    else:
-                        # Use strided view if shapes differ but sizes match
-                        if not current_tensor.is_contiguous():
-                            current_tensor = current_tensor.contiguous()
-                        
-                        strided_view = torch.as_strided(
-                            current_tensor,
-                            original_tensor.shape,
-                            original_tensor.stride(),
-                        )
-                        original_tensor.copy_(strided_view)
-                    
-                    logger.debug(f"[QuantizedRL] Restored updated parameter '{name}'")
-                    
-                except Exception as e:
-                    logger.error(f"[QuantizedRL] Failed to restore parameter '{name}': {e}")
-                    logger.error(f"[QuantizedRL] Shapes - original: {original_tensor.shape}, current: {current_tensor.shape}")
-                    # Fallback: direct assignment
-                    try:
-                        original_tensor.copy_(current_tensor.view(original_tensor.shape))
-                    except Exception as e2:
-                        logger.error(f"[QuantizedRL] Fallback also failed for '{name}': {e2}")
-                        continue
-            
-            # Restore the original tensor reference
-            current_param.data = original_tensor
+                strided_data = torch.as_strided(
+                    p.data,
+                    original_param_dict[name].shape,
+                    original_param_dict[name].stride(),
+                )
+                original_param_dict[name].copy_(strided_data)
 
+            # Restore the original tensor reference without deleting first
+            p.data = original_param_dict[name]
 
-
-
-
-        # Clean up
         del original_param_dict
         del existing_params
-        del current_params
         gc.collect()
 
         # Restore workspace

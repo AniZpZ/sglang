@@ -177,51 +177,12 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Ensure tensors are contiguous and on the same device to avoid ROPE errors
-        if not hidden_states.is_contiguous():
-            hidden_states = hidden_states.contiguous()
-            logger.warning(f"[QWEN2_ATTN] Made hidden states contiguous: {hidden_states.shape}")
-        if not positions.is_contiguous():
-            positions = positions.contiguous()
-            logger.warning(f"[QWEN2_ATTN] Made positions contiguous: {positions.shape}")
-        
-        try:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            
-            # Ensure q and k are contiguous before ROPE
-            if not q.is_contiguous():
-                q = q.contiguous()
-            if not k.is_contiguous():
-                k = k.contiguous()
-            
-            # Ensure all tensors are on the same device
-            if positions.device != q.device:
-                logger.warning(f"[QWEN2_ATTN] Device mismatch: positions on {positions.device}, q on {q.device}")
-                positions = positions.to(q.device)
-            
-            try:
-                q, k = self.rotary_emb(positions, q, k)
-            except Exception as e:
-                logger.error(f"[QWEN2_ATTN] Rotary embedding failed: {e}")
-                logger.error(f"[QWEN2_ATTN] Inputs - positions: {positions.shape} {positions.device}, q: {q.shape} {q.device}, k: {k.shape} {k.device}")
-                logger.error(f"[QWEN2_ATTN] Contiguity - positions: {positions.is_contiguous()}, q: {q.is_contiguous()}, k: {k.is_contiguous()}")
-                raise
-            
-            try:
-                attn_output = self.attn(q, k, v, forward_batch)
-            except Exception as e:
-                logger.error(f"[QWEN2_ATTN] Attention computation failed: {e}")
-                logger.error(f"[QWEN2_ATTN] QKV shapes - q: {q.shape}, k: {k.shape}, v: {v.shape}")
-                raise
-            
-            output, _ = self.o_proj(attn_output)
-            return output
-            
-        except Exception as e:
-            logger.error(f"[QWEN2_ATTN] Attention forward failed: {type(e).__name__}: {e}")
-            raise
-
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
