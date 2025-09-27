@@ -177,21 +177,35 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Check for potential memory issues
+        # Ensure tensors are contiguous and on the same device to avoid ROPE errors
         if not hidden_states.is_contiguous():
-            logger.warning(f"[QWEN2_ATTN] Hidden states not contiguous: {hidden_states.shape}")
+            hidden_states = hidden_states.contiguous()
+            logger.warning(f"[QWEN2_ATTN] Made hidden states contiguous: {hidden_states.shape}")
         if not positions.is_contiguous():
-            logger.warning(f"[QWEN2_ATTN] Positions not contiguous: {positions.shape}")
+            positions = positions.contiguous()
+            logger.warning(f"[QWEN2_ATTN] Made positions contiguous: {positions.shape}")
         
         try:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            
+            # Ensure q and k are contiguous before ROPE
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            
+            # Ensure all tensors are on the same device
+            if positions.device != q.device:
+                logger.warning(f"[QWEN2_ATTN] Device mismatch: positions on {positions.device}, q on {q.device}")
+                positions = positions.to(q.device)
             
             try:
                 q, k = self.rotary_emb(positions, q, k)
             except Exception as e:
                 logger.error(f"[QWEN2_ATTN] Rotary embedding failed: {e}")
                 logger.error(f"[QWEN2_ATTN] Inputs - positions: {positions.shape} {positions.device}, q: {q.shape} {q.device}, k: {k.shape} {k.device}")
+                logger.error(f"[QWEN2_ATTN] Contiguity - positions: {positions.is_contiguous()}, q: {q.is_contiguous()}, k: {k.is_contiguous()}")
                 raise
             
             try:
@@ -652,20 +666,36 @@ class Qwen2ForCausalLM(nn.Module):
             
             return updated_param_names
 
-        # Check if this is a reload scenario for QuantizedRLModelLoader
+        # Check if this is a reload scenario
+        # First check if we have the necessary attributes for reload
         try:
             from sglang.srt.model_loader.loader import QuantizedRLModelLoader
             
-            if QuantizedRLModelLoader.is_reload_scenario(self):
-                logger.info("[QuantizedRL]: use rebinding for efficient weight swapping")
-                # This is a true reload: use rebinding for efficient weight swapping
+            # Check for reload scenario: we have the original weights rebuild keys and recorded loaders
+            is_reload_scenario = (
+                hasattr(self, "original_weights_rebuild_keys") and 
+                hasattr(self, "recorded_loader") and
+                getattr(self, "process_weights_after_loading_already_called", False)
+            )
+            
+            if not is_reload_scenario:
+                logger.info("[QuantizedRL]: First load - use standard loading")
+                # First load: use standard loading and record state
+                updated_params = custom_load_weights(weights)
+                
+                # After first load, ensure we have the necessary state for future reloads
+                if not hasattr(self, "original_weights_rebuild_keys"):
+                    logger.warning("[QuantizedRL] Missing original_weights_rebuild_keys after first load")
+                if not hasattr(self, "recorded_loader"):
+                    logger.warning("[QuantizedRL] Missing recorded_loader after first load")
+                    
+                return updated_params
+            else:
+                logger.info("[QuantizedRL]: Subsequent load - use rebinding for efficient weight swapping")
+                # Subsequent load: use rebinding for efficient weight swapping
                 return QuantizedRLModelLoader.rebinding_and_load_weights(
                     self, custom_load_weights, weights
                 )
-            else:
-                logger.info("[QuantizedRL]: use standard loading")
-                # First load or loader is setting up: use standard loading
-                return custom_load_weights(weights)
                 
         except (ImportError, Exception) as e:
             logger.warning(f"[QuantizedRL] QuantizedRLModelLoader not available or failed: {e}")

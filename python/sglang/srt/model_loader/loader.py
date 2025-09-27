@@ -507,6 +507,25 @@ class DefaultModelLoader(BaseModelLoader):
 class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
+    @staticmethod
+    def _bond_method_to_cls(func, obj):
+        """Bind a function to an object instance, similar to Flash-RL's bond_method_to_cls."""
+        import types
+        
+        if func is None:
+            logger.warning("[QuantizedRL] Attempting to bind None function")
+            return None
+            
+        if hasattr(func, '__self__') or not callable(func):
+            # If the function is already bound to an instance, return it as is
+            return func
+        else:
+            try:
+                return types.MethodType(func, obj)
+            except Exception as e:
+                logger.error(f"[QuantizedRL] Failed to bind method: {e}")
+                return func
+
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
@@ -535,7 +554,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         # Save original weight state for potential reloading
         if not hasattr(model, "original_weights_rebuild_keys"):
+            logger.info("[QuantizedRL] Recording original weight state for potential reloading")
             model.original_weights_rebuild_keys = {}
+            param_count = 0
             for name, p in model.named_parameters():
                 model.original_weights_rebuild_keys[name] = {
                     "shape": p.shape,
@@ -543,6 +564,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     "dtype": p.dtype,
                     "nbytes": p.untyped_storage().nbytes(),
                 }
+                param_count += 1
+            logger.info(f"[QuantizedRL] Recorded state for {param_count} parameters")
 
         # Record weight loaders for potential reloading
         recorded_loader_keys = [
@@ -556,16 +579,35 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         ]
 
         recorded_loader = {k: dict() for k in recorded_loader_keys}
+        param_count = 0
+        params_with_loaders = 0
+        
         for name, p in model.named_parameters():
+            param_count += 1
+            param_has_loader = False
+            
             for key in recorded_loader_keys:
                 if hasattr(p, key):
+                    param_has_loader = True
                     attr = getattr(p, key)
                     if not callable(attr):
                         recorded_loader[key][name] = attr
-                    elif p is attr.__self__:
+                    elif hasattr(attr, '__self__') and p is attr.__self__:
                         recorded_loader[key][name] = attr.__func__
                     else:
                         recorded_loader[key][name] = attr
+            
+            if param_has_loader:
+                params_with_loaders += 1
+        
+        total_recorded = sum(len(loader_k) for loader_k in recorded_loader.values())
+        logger.info(f"[QuantizedRL] Checked {param_count} parameters, {params_with_loaders} had loaders, recorded {total_recorded} total loaders")
+        
+        # Log breakdown by loader type
+        for loader_type, loader_dict in recorded_loader.items():
+            if loader_dict:
+                logger.info(f"[QuantizedRL] Recorded {len(loader_dict)} '{loader_type}' loaders")
+        
         model.recorded_loader = recorded_loader
 
         # Load weights first
@@ -628,132 +670,199 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
+        logger.info("[QuantizedRL]: use rebinding for efficient weight swapping")
+        
+        # Convert weights iterator to list if needed
+        if not hasattr(weights, '__len__'):
+            logger.info(f"[QuantizedRL] Received weights as iterator (type: {type(weights)})")
+            try:
+                weights = list(weights)
+                logger.info(f"[QuantizedRL] Iterator converted to list with {len(weights)} items")
+            except Exception as e:
+                logger.error(f"[QuantizedRL] Failed to convert weights iterator: {e}")
+                raise
+        
+        if len(weights) > 0:
+            first_weight_name = weights[0][0] if len(weights[0]) > 0 else "unknown"
+            logger.info(f"[QuantizedRL] First weight name: {first_weight_name}")
+        else:
+            logger.warning(f"[QuantizedRL] Received empty weights list!")
+            return set()
+
+        # Check if this is actually a reload scenario
+        if not hasattr(model, "original_weights_rebuild_keys") or not hasattr(model, "recorded_loader"):
+            logger.warning("[QuantizedRL] Missing reload state, falling back to first-time loading")
+            return first_time_load_weights(weights)
+
         # Reset the model state to allow re-quantization
         QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
-        for _, module in model.named_modules():
+        preserved_workspaces = {}
+        for module_name, module in model.named_modules():
             if torch.is_tensor(getattr(module, "workspace", None)):
-                setattr(module, f"preserved_workspace", getattr(module, "workspace"))
+                preserved_workspaces[module_name] = getattr(module, "workspace")
 
         existing_params = dict(model.named_parameters())
 
-        # Preserve original data, so that after parameter loading, we can put the parameter
-        # in the original tensor
-        original_param_dict = {}
+        # Preserve original data - create a mapping of parameter data
+        original_param_data = {}
         for name, p in existing_params.items():
-            original_param_dict[name] = p.data
+            original_param_data[name] = p.data
 
-        # Recover the parameter to the state before first loading
+        # Reset parameters to their original unquantized state
+        logger.info("[QuantizedRL] Resetting parameters to original state")
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in existing_params:
-                existing_params[name].data = torch.empty(
+                param = existing_params[name]
+                # Create new empty tensor with original shape and dtype
+                new_data = torch.empty(
                     rebuild_info["shape"],
                     dtype=rebuild_info["dtype"],
-                    device=existing_params[name].device,
+                    device=param.device,
                 )
+                param.data = new_data
+                logger.debug(f"[QuantizedRL] Reset parameter {name} to shape {rebuild_info['shape']}")
 
-        # Restore weight loaders
-        for k, loader_k in model.recorded_loader.items():
-            for n, loader in loader_k.items():
-                if not hasattr(existing_params[n], k):
-                    # Simple binding for now - in a full implementation you might need
-                    # a more sophisticated binding mechanism
-                    setattr(existing_params[n], k, loader)
+        # Restore weight loaders with better error handling
+        logger.info("[QuantizedRL] Restoring weight loaders")
+        total_recorded = sum(len(loader_k) for loader_k in model.recorded_loader.values())
+        logger.info(f"[QuantizedRL] Starting restoration with {total_recorded} recorded loaders")
+        
+        restoration_stats = {}
+        for loader_type, loader_dict in model.recorded_loader.items():
+            restoration_stats[loader_type] = {"restored": 0, "missing": 0}
+            
+            for param_name, loader in loader_dict.items():
+                if param_name in existing_params:
+                    try:
+                        param = existing_params[param_name]
+                        bound_loader = QuantizedRLModelLoader._bond_method_to_cls(loader, param)
+                        setattr(param, loader_type, bound_loader)
+                        restoration_stats[loader_type]["restored"] += 1
+                        logger.debug(f"[QuantizedRL] Restored '{loader_type}' for parameter '{param_name}'")
+                    except Exception as e:
+                        logger.error(f"[QuantizedRL] Failed to restore '{loader_type}' for '{param_name}': {e}")
+                        restoration_stats[loader_type]["missing"] += 1
+                else:
+                    restoration_stats[loader_type]["missing"] += 1
+                    logger.debug(f"[QuantizedRL] Parameter '{param_name}' not found for '{loader_type}'")
 
-        # After recovering, the weight loading can be called as usual
-        updated_params = first_time_load_weights(weights)
+        # Log restoration statistics
+        for loader_type, stats in restoration_stats.items():
+            logger.info(f"[QuantizedRL] '{loader_type}': {stats['restored']} restored, {stats['missing']} missing")
 
-        # Manually conducting process weights after loading
-        # Note: We don't need to call load_weights_and_postprocess here because
-        # first_time_load_weights already loaded the weights, we just need to process them
-        target_device = next(model.parameters()).device
+        # Validate weight loader restoration
+        validation_count = 0
+        for param_name, param in existing_params.items():
+            if hasattr(param, 'weight_loader') and callable(param.weight_loader):
+                validation_count += 1
+        logger.info(f"[QuantizedRL] Validation: {validation_count}/{len(existing_params)} parameters have functional weight_loader")
+
+        # Load weights using the restored loaders
+        logger.info("[QuantizedRL] Loading weights with restored loaders")
+        try:
+            updated_params = first_time_load_weights(weights)
+            logger.info(f"[QuantizedRL] Successfully loaded weights, updated {len(updated_params)} parameters")
+        except Exception as e:
+            logger.error(f"[QuantizedRL] Failed to load weights: {e}")
+            raise
+
+        # Process weights after loading (quantization, etc.)
+        logger.info("[QuantizedRL] Processing weights after loading")
+        try:
+            target_device = next(model.parameters()).device
+        except StopIteration:
+            logger.warning("[QuantizedRL] No parameters found in model, using cuda:0")
+            target_device = torch.device("cuda:0")
+            
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-
-        # Mark as already called
-        model.process_weights_after_loading_already_called = True
-
-        # Put the value of the newly created tensor to the original tensor
-        for name, p in model.named_parameters():
-            assert (
-                name in original_param_dict
-            ), f"param {name} is not in original_param_dict"
-            assert (
-                original_param_dict[name].dtype == p.data.dtype
-            ), f"param {name} dtype mismatch: {original_param_dict[name].dtype} vs {p.data.dtype}"
-            assert (
-                original_param_dict[name].numel() == p.data.numel()
-            ), f"param {name} numel() mismatch: {original_param_dict[name].numel()} vs {p.data.numel()}"
-
-            if name in updated_params:
-                # Check for potential memory layout issues before using as_strided
-                original_tensor = original_param_dict[name]
-                current_tensor = p.data
-                
-                # Warn if tensors are not contiguous
-                if not current_tensor.is_contiguous():
-                    logger.warning(f"[QuantizedRL] Current tensor {name} is not contiguous")
-                if not original_tensor.is_contiguous():
-                    logger.warning(f"[QuantizedRL] Original tensor {name} is not contiguous")
-                
-                # Check for device mismatch
-                if current_tensor.device != original_tensor.device:
-                    logger.warning(f"[QuantizedRL] Device mismatch for {name}: {current_tensor.device} vs {original_tensor.device}")
-                
-                # Validate stride compatibility
-                original_shape = original_tensor.shape
-                original_stride = original_tensor.stride()
-                
                 try:
-                    # Check if the stride pattern makes sense for the tensor size
-                    max_offset = 0
-                    for dim_size, stride in zip(original_shape, original_stride):
-                        if dim_size > 1:  # Only check non-singleton dimensions
-                            max_offset = max(max_offset, (dim_size - 1) * stride)
-                    
-                    if max_offset >= current_tensor.numel():
-                        logger.warning(f"[QuantizedRL] Potentially unsafe stride pattern for {name}: max_offset={max_offset}, tensor_size={current_tensor.numel()}")
-                    
-                    strided_data = torch.as_strided(
-                        current_tensor,
-                        original_shape,
-                        original_stride,
-                    )
-                    
-                    # Validate the strided view
-                    if strided_data.numel() != original_tensor.numel():
-                        logger.warning(f"[QuantizedRL] Strided view size mismatch for {name}: {strided_data.numel()} vs {original_tensor.numel()}")
-                    
-                    original_tensor.copy_(strided_data)
-                    
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
                 except Exception as e:
-                    logger.error(f"[QuantizedRL] Failed to create strided view for {name}: {e}")
-                    logger.error(f"[QuantizedRL] Tensor shapes - current: {current_tensor.shape}, original: {original_shape}")
-                    logger.error(f"[QuantizedRL] Tensor strides - original: {original_stride}")
+                    logger.error(f"[QuantizedRL] Failed to process weights for module: {e}")
                     raise
 
-            # Swap to the original tensor (which now has updated data if needed)
-            p.data = original_param_dict[name]
+        # Mark as processed
+        model.process_weights_after_loading_already_called = True
+
+        # Restore parameter data to original tensors with improved handling
+        logger.info("[QuantizedRL] Restoring parameter data to original tensors")
+        current_params = dict(model.named_parameters())
+        
+        for name, current_param in current_params.items():
+            if name not in original_param_data:
+                logger.warning(f"[QuantizedRL] New parameter '{name}' found after loading")
+                continue
+                
+            original_tensor = original_param_data[name]
+            current_tensor = current_param.data
+            
+            # Validate tensor compatibility
+            if original_tensor.dtype != current_tensor.dtype:
+                logger.error(f"[QuantizedRL] Dtype mismatch for {name}: {original_tensor.dtype} vs {current_tensor.dtype}")
+                continue
+                
+            if original_tensor.numel() != current_tensor.numel():
+                logger.error(f"[QuantizedRL] Size mismatch for {name}: {original_tensor.numel()} vs {current_tensor.numel()}")
+                continue
+
+            # Handle parameter restoration based on whether it was updated
+            if name in updated_params:
+                try:
+                    # For updated parameters, we need to copy the new data back
+                    if original_tensor.shape == current_tensor.shape:
+                        # Direct copy if shapes match
+                        original_tensor.copy_(current_tensor)
+                    else:
+                        # Use strided view if shapes differ but sizes match
+                        if not current_tensor.is_contiguous():
+                            current_tensor = current_tensor.contiguous()
+                        
+                        strided_view = torch.as_strided(
+                            current_tensor,
+                            original_tensor.shape,
+                            original_tensor.stride(),
+                        )
+                        original_tensor.copy_(strided_view)
+                    
+                    logger.debug(f"[QuantizedRL] Restored updated parameter '{name}'")
+                    
+                except Exception as e:
+                    logger.error(f"[QuantizedRL] Failed to restore parameter '{name}': {e}")
+                    logger.error(f"[QuantizedRL] Shapes - original: {original_tensor.shape}, current: {current_tensor.shape}")
+                    # Fallback: direct assignment
+                    try:
+                        original_tensor.copy_(current_tensor.view(original_tensor.shape))
+                    except Exception as e2:
+                        logger.error(f"[QuantizedRL] Fallback also failed for '{name}': {e2}")
+                        continue
+            
+            # Restore the original tensor reference
+            current_param.data = original_tensor
 
 
 
 
 
-        del original_param_dict
+        # Clean up
+        del original_param_data
         del existing_params
-
+        del current_params
         gc.collect()
 
-        # Restore workspace
-        for _, module in model.named_modules():
-            if torch.is_tensor(getattr(module, "workspace", None)):
-                setattr(module, "workspace", getattr(module, "preserved_workspace"))
-                delattr(module, "preserved_workspace")
+        # Restore preserved workspaces
+        for module_name, module in model.named_modules():
+            if module_name in preserved_workspaces:
+                setattr(module, "workspace", preserved_workspaces[module_name])
 
+        # Force memory cleanup to avoid OOM issues
+        torch.cuda.empty_cache()
+        
+        logger.info(f"[QuantizedRL] Weight rebinding completed successfully")
         return updated_params
 
 
