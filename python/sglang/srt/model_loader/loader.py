@@ -670,30 +670,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
-        logger.info("[QuantizedRL]: use rebinding for efficient weight swapping")
-        
-        # Convert weights iterator to list if needed
-        if not hasattr(weights, '__len__'):
-            logger.info(f"[QuantizedRL] Received weights as iterator (type: {type(weights)})")
-            try:
-                weights = list(weights)
-                logger.info(f"[QuantizedRL] Iterator converted to list with {len(weights)} items")
-            except Exception as e:
-                logger.error(f"[QuantizedRL] Failed to convert weights iterator: {e}")
-                raise
-        
-        if len(weights) > 0:
-            first_weight_name = weights[0][0] if len(weights[0]) > 0 else "unknown"
-            logger.info(f"[QuantizedRL] First weight name: {first_weight_name}")
-        else:
-            logger.warning(f"[QuantizedRL] Received empty weights list!")
-            return set()
-
-        # Check if this is actually a reload scenario
-        if not hasattr(model, "original_weights_rebuild_keys") or not hasattr(model, "recorded_loader"):
-            logger.warning("[QuantizedRL] Missing reload state, falling back to first-time loading")
-            return first_time_load_weights(weights)
-
         # Reset the model state to allow re-quantization
         QuantizedRLModelLoader.reset_model_weights_state(model)
 
@@ -706,9 +682,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         existing_params = dict(model.named_parameters())
 
         # Preserve original data - create a mapping of parameter data
-        original_param_data = {}
+        original_param_dict = {}
         for name, p in existing_params.items():
-            original_param_data[name] = p.data
+            original_param_dict[name] = p.data
 
         # Reset parameters to their original unquantized state
         logger.info("[QuantizedRL] Resetting parameters to original state")
@@ -794,11 +770,11 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         current_params = dict(model.named_parameters())
         
         for name, current_param in current_params.items():
-            if name not in original_param_data:
+            if name not in original_param_dict:
                 logger.warning(f"[QuantizedRL] New parameter '{name}' found after loading")
                 continue
                 
-            original_tensor = original_param_data[name]
+            original_tensor = original_param_dict[name]
             current_tensor = current_param.data
             
             # Validate tensor compatibility
@@ -849,7 +825,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
 
         # Clean up
-        del original_param_data
+        del original_param_dict
         del existing_params
         del current_params
         gc.collect()
