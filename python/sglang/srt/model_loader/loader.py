@@ -508,7 +508,23 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
     # Preserved module attributes that need to be restored after weight reloading
-    PRESERVED_MODULE_ATTRIBUTES = ["workspace"]
+    PRESERVED_MODULE_ATTRIBUTES = [
+        "workspace",
+        # RoPE cache attributes
+        "cos_sin_cache", 
+        "short_cos_sin_cache",
+        "long_cos_sin_cache", 
+        "long_short_cos_sin_cache",
+        "cos_sin_q_cache",
+        "cos_sin_qc_cache", 
+        "cos_sin_k_cache",
+        "cos_sin_qc_no_clamp_cache",
+        "cos_sin_q_inter_cache",
+        "inv_freq",
+        # # Other quantization-related attributes, if uncommented, the training will proceed weiht no reward
+        # "k_scale",
+        # "v_scale"
+    ]
 
     @staticmethod
     def _bond_method_to_cls(func, obj):
@@ -675,9 +691,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         for module_name, module in model.named_modules():
             for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
                 attr_value = getattr(module, attr_name, None)
-                if torch.is_tensor(attr_value):
+                if attr_value is not None:
                     preserve_key = f"{module_name}.{attr_name}"
-                    preserved_attributes[preserve_key] = attr_value.clone()
+                    if torch.is_tensor(attr_value):
+                        # Clone tensor attributes to preserve them
+                        preserved_attributes[preserve_key] = attr_value.clone()
+                    else:
+                        # Preserve non-tensor attributes as-is
+                        preserved_attributes[preserve_key] = attr_value
         
         logger.info(f"[QuantizedRL] Preserved attributes: {list(preserved_attributes.keys())}")
 
@@ -776,9 +797,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
                 preserve_key = f"{module_name}.{attr_name}"
                 if preserve_key in preserved_attributes:
-                    setattr(module, attr_name, preserved_attributes[preserve_key])
+                    preserved_value = preserved_attributes[preserve_key]
+                    setattr(module, attr_name, preserved_value)
                     restored_attributes += 1
-                    logger.debug(f"[QuantizedRL] Restored module attribute '{preserve_key}' to module '{module_name}'")
+                    logger.debug(f"[QuantizedRL] Restored module attribute '{preserve_key}' to module '{module_name}' (type: {type(preserved_value).__name__})")
         
         logger.info(f"[QuantizedRL] Restored {restored_attributes}/{len(preserved_attributes)} preserved module attributes")
 
