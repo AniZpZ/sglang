@@ -679,14 +679,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     preserve_key = f"{module_name}.{attr_name}"
                     preserved_attributes[preserve_key] = attr_value.clone()
         
-        logger.info(f"[QuantizedRL] Preserved {len(preserved_attributes)} module attributes")
-        if len(preserved_attributes) > 0:
-            logger.info(f"[QuantizedRL] Preserved attributes: {list(preserved_attributes.keys())}")
-            # Log details about preserved attributes
-            for key, value in preserved_attributes.items():
-                logger.info(f"[QuantizedRL] Preserved '{key}': shape={value.shape}, dtype={value.dtype}, device={value.device}")
-        else:
-            logger.info("[QuantizedRL] No module attributes were preserved")
+        logger.info(f"[QuantizedRL] Preserved attributes: {list(preserved_attributes.keys())}")
 
         # Reset the model state to allow re-quantization
         logger.info("[QuantizedRL] Resetting model weights state")
@@ -697,7 +690,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Clone original data for all parameters
         original_param_dict = {}
         for name, p in existing_params.items():
-            original_param_dict[name] = p.data.clone()
+            original_param_dict[name] = p.data
 
         logger.info(f"[QuantizedRL] Cloned data for {len(original_param_dict)} parameters")
         logger.info(f"[QuantizedRL] Cloned parameter data (first 5): {list(original_param_dict.keys())[:5]}")
@@ -766,9 +759,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     original_param_dict[name].stride(),
                 )
                 original_param_dict[name].copy_(strided_data)
-
-            del p.data
+            tmp_data = p.data
             p.data = original_param_dict[name]
+            del tmp_data
         
         logger.info(f"[QuantizedRL] Parameter restoration completed: {restored_param_count}/{len(updated_params)} parameters restored")
         logger.info(f"[QuantizedRL] Skipped: {skipped_missing} missing from original dict")
