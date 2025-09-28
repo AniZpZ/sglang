@@ -639,14 +639,14 @@ class Qwen2ForCausalLM(nn.Module):
                         skipped_weights += 1
             
             # Log final statistics
-            logger.info(f"[Qwen2] Weight loading completed:")
+            import os
+            pid = os.getpid()
+            logger.info(f"[Qwen2] Weight loading completed (PID {pid}):")
             logger.info(f"[Qwen2]   - Total weights processed: {total_weights_processed}")
-            logger.info(f"[Qwen2]   - Parameters updated: {len(updated_param_names)}")
+            logger.info(f"[Qwen2]   - Parameters updated: {len(updated_param_names)}, Updated parameters (first 10): {list(updated_param_names)[:10]}")
             logger.info(f"[Qwen2]   - Weights skipped: {skipped_weights}")
             logger.info(f"[Qwen2]   - Model parameters: {len(params_dict)}")
             
-            if len(updated_param_names) > 0:
-                logger.info(f"[Qwen2] Updated parameters (first 10): {list(updated_param_names)[:10]}")
             
             return updated_param_names
 

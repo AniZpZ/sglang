@@ -507,6 +507,9 @@ class DefaultModelLoader(BaseModelLoader):
 class QuantizedRLModelLoader(DefaultModelLoader):
     """Model loader with FlashRL-specific functionality for advanced weight management."""
 
+    # Preserved module attributes that need to be restored after weight reloading
+    PRESERVED_MODULE_ATTRIBUTES = ["workspace"]
+
     @staticmethod
     def _bond_method_to_cls(func, obj):
         """Bind a function to an object instance, following Flash-RL's bond_method_to_cls approach."""
@@ -548,6 +551,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             logger.info("[QuantizedRL] Recording original weight state for potential reloading")
             model.original_weights_rebuild_keys = {}
             param_count = 0
+            
             for name, p in model.named_parameters():
                 model.original_weights_rebuild_keys[name] = {
                     "shape": p.shape,
@@ -556,6 +560,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     "nbytes": p.untyped_storage().nbytes(),
                 }
                 param_count += 1
+            
             logger.info(f"[QuantizedRL] Recorded state for {param_count} parameters")
 
         # Record weight loaders for potential reloading
@@ -656,7 +661,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             )
                             param.data = new_data
                         except Exception as e:
-                            logger.warning(f"Failed to reset parameter {name}: {e}")
+                            logger.warning(f"[QuantizedRL] Failed to reset parameter {name}: {e}")
                             # Continue with other parameters
                             continue
 
@@ -665,24 +670,39 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         """Reload weights with proper state management for multiple loading scenarios."""
         logger.info("[QuantizedRL] Starting rebinding_and_load_weights process")
         
+        # Preserve critical module attributes (RoPE caches, workspace, etc.)
+        preserved_attributes = {}
+        for module_name, module in model.named_modules():
+            for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
+                attr_value = getattr(module, attr_name, None)
+                if torch.is_tensor(attr_value):
+                    preserve_key = f"{module_name}.{attr_name}"
+                    preserved_attributes[preserve_key] = attr_value.clone()
+        
+        logger.info(f"[QuantizedRL] Preserved {len(preserved_attributes)} module attributes")
+        if len(preserved_attributes) > 0:
+            logger.info(f"[QuantizedRL] Preserved attributes: {list(preserved_attributes.keys())}")
+            # Log details about preserved attributes
+            for key, value in preserved_attributes.items():
+                logger.info(f"[QuantizedRL] Preserved '{key}': shape={value.shape}, dtype={value.dtype}, device={value.device}")
+        else:
+            logger.info("[QuantizedRL] No module attributes were preserved")
+
         # Reset the model state to allow re-quantization
         logger.info("[QuantizedRL] Resetting model weights state")
         QuantizedRLModelLoader.reset_model_weights_state(model)
 
-        # Preserve workspace if exists
-        for _, module in model.named_modules():
-            if torch.is_tensor(getattr(module, "workspace", None)):
-                setattr(module, "preserved_workspace", getattr(module, "workspace"))
-
         existing_params = dict(model.named_parameters())
 
-        # Preserve original data, so that after parameter loading, we can put the parameter
-        # in the original tensor
+        # Clone original data for all parameters
         original_param_dict = {}
         for name, p in existing_params.items():
-            original_param_dict[name] = p.data
+            original_param_dict[name] = p.data.clone()
 
-        # Recover the parameter to the state before first loading
+        logger.info(f"[QuantizedRL] Cloned data for {len(original_param_dict)} parameters")
+        logger.info(f"[QuantizedRL] Cloned parameter data (first 5): {list(original_param_dict.keys())[:5]}")
+
+        # Recover all parameters to the state before first loading
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in existing_params:
                 existing_params[name].data = torch.empty(
@@ -690,49 +710,31 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     dtype=rebuild_info["dtype"],
                     device=existing_params[name].device,
                 )
-            else:
-                logger.warning(f"[QuantizedRL] Parameter '{name}' not found during recovery, skipping")
 
-        # Restore weight loaders (following Flash-RL approach)
+        # Restore weight loaders for all parameters
         logger.info(f"[QuantizedRL] Starting weight loader restoration for {len(model.recorded_loader)} loader types")
         restored_count = 0
         for k, loader_k in model.recorded_loader.items():
-            type_restored_count = 0
-            logger.info(f"[QuantizedRL] Restoring '{k}' loaders for {len(loader_k)} parameters")
             for n, loader in loader_k.items():
                 if n not in existing_params:
-                    logger.warning(f"[QuantizedRL] Parameter '{n}' not found in existing_params, skipping '{k}' restoration")
                     continue
                 
-                # Always use bond_method_to_cls for consistent binding (Flash-RL approach)
                 if callable(loader):
                     bound_loader = QuantizedRLModelLoader._bond_method_to_cls(loader, existing_params[n])
                     setattr(existing_params[n], k, bound_loader)
                 else:
-                    # Non-callable attribute (like dimensions)
                     setattr(existing_params[n], k, loader)
-                
-                type_restored_count += 1
                 restored_count += 1
-            
-            logger.info(f"[QuantizedRL] Restored {type_restored_count}/{len(loader_k)} '{k}' loaders")
         
         logger.info(f"[QuantizedRL] Total weight loaders restored: {restored_count}")
 
         # After recovering, the weight loading can be called as usual
         logger.info("[QuantizedRL] Starting weight loading with restored loaders")
-        try:
-            updated_params = first_time_load_weights(weights)
-            logger.info(f"[QuantizedRL] Weight loading completed successfully, updated {len(updated_params)} parameters")
-            if len(updated_params) > 0:
-                logger.info(f"[QuantizedRL] Updated parameters: {list(updated_params)[:5]}...")  # Show first 5
-        except Exception as e:
-            logger.error(f"[QuantizedRL] Weight loading failed with restored loaders: {e}")
-            raise
+        updated_params = first_time_load_weights(weights)
+        logger.info(f"[QuantizedRL] Weight loading completed successfully, updated {len(updated_params)} parameters, (first 5): {list(updated_params)[:5]}")
+        
 
-        # Manually conducting process weights after loading
-        # Note: We don't need to call load_weights_and_postprocess here because
-        # first_time_load_weights already loaded the weights, we just need to process them
+        # Process weights after loading (quantization, etc.)
         target_device = next(model.parameters()).device
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
@@ -740,12 +742,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        # Mark as already called
         model.process_weights_after_loading_already_called = True
 
-        # Put the value of the newly created tensor to the original tensor
-        logger.info(f"[QuantizedRL] Starting parameter restoration for {len(list(model.named_parameters()))} parameters")
+        # Restore parameter data for all parameters
         restored_param_count = 0
+        skipped_missing = 0
+        
         for name, p in model.named_parameters():
             assert (
                 name in original_param_dict
@@ -764,23 +766,47 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     original_param_dict[name].stride(),
                 )
                 original_param_dict[name].copy_(strided_data)
-                restored_param_count += 1
 
-            # Restore the original tensor reference without deleting first
+            del p.data
             p.data = original_param_dict[name]
         
-        logger.info(f"[QuantizedRL] Parameter restoration completed: {restored_param_count}/{len(updated_params)} parameters restored with updated weights")
+        logger.info(f"[QuantizedRL] Parameter restoration completed: {restored_param_count}/{len(updated_params)} parameters restored")
+        logger.info(f"[QuantizedRL] Skipped: {skipped_missing} missing from original dict")
+        
+        # Additional debugging: verify that updated parameters actually have different values
+        if len(updated_params) > 0:
+            logger.info(f"[QuantizedRL] Successfully updated {len(updated_params)} parameters for RL training")
 
-        # Clean up references (Flash-RL approach)
+        # Restore preserved module attributes
+        restored_attributes = 0
+        for module_name, module in model.named_modules():
+            for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
+                preserve_key = f"{module_name}.{attr_name}"
+                if preserve_key in preserved_attributes:
+                    setattr(module, attr_name, preserved_attributes[preserve_key])
+                    restored_attributes += 1
+                    logger.debug(f"[QuantizedRL] Restored module attribute '{preserve_key}' to module '{module_name}'")
+        
+        logger.info(f"[QuantizedRL] Restored {restored_attributes}/{len(preserved_attributes)} preserved module attributes")
+
+        # Enhanced CUDA synchronization and cleanup
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            # Clear any pending CUDA operations
+            torch.cuda.empty_cache()
+        
+        # More thorough cleanup
         del original_param_dict
         del existing_params
+        del preserved_attributes
+        
+        # Force garbage collection
         gc.collect()
-
-        # Restore workspace
-        for _, module in model.named_modules():
-            if torch.is_tensor(getattr(module, "workspace", None)):
-                setattr(module, "workspace", getattr(module, "preserved_workspace"))
-                delattr(module, "preserved_workspace")
+        
+        # Final CUDA cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         return updated_params
 
