@@ -564,8 +564,12 @@ class Qwen2ForCausalLM(nn.Module):
 
             params_dict = dict(self.named_parameters())
             updated_param_names = set()
+            total_weights_processed = 0
+            skipped_weights = 0
+            logger.info(f"[Qwen2] Starting weight loading with {len(params_dict)} model parameters")
             
             for name, loaded_weight in weights:
+                total_weights_processed += 1
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
@@ -575,13 +579,16 @@ class Qwen2ForCausalLM(nn.Module):
                         or layer_id >= self.model.end_layer
                     )
                 ):
+                    skipped_weights += 1
                     continue
 
                 if "rotary_emb.inv_freq" in name or "projector" in name:
+                    skipped_weights += 1
                     continue
                 if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                     # Models trained using ColossalAI may include these tensors in
                     # the checkpoint. Skip them.
+                    skipped_weights += 1
                     continue
                 if self.config.tie_word_embeddings and "lm_head.weight" in name:
                     if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
@@ -592,8 +599,10 @@ class Qwen2ForCausalLM(nn.Module):
                         )[1]
                         loaded_weight = embed_token_weights
                     else:
+                        skipped_weights += 1
                         continue
                 if name.startswith("model.vision_tower") and name not in params_dict:
+                    skipped_weights += 1
                     continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -602,8 +611,10 @@ class Qwen2ForCausalLM(nn.Module):
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        skipped_weights += 1
                         continue
                     if name not in params_dict:
+                        skipped_weights += 1
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -613,6 +624,7 @@ class Qwen2ForCausalLM(nn.Module):
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        skipped_weights += 1
                         continue
 
                     if name in params_dict.keys():
@@ -623,7 +635,18 @@ class Qwen2ForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                         updated_param_names.add(name)
                     else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                        logger.warning(f"[Qwen2] Parameter {name} not found in params_dict")
+                        skipped_weights += 1
+            
+            # Log final statistics
+            logger.info(f"[Qwen2] Weight loading completed:")
+            logger.info(f"[Qwen2]   - Total weights processed: {total_weights_processed}")
+            logger.info(f"[Qwen2]   - Parameters updated: {len(updated_param_names)}")
+            logger.info(f"[Qwen2]   - Weights skipped: {skipped_weights}")
+            logger.info(f"[Qwen2]   - Model parameters: {len(params_dict)}")
+            
+            if len(updated_param_names) > 0:
+                logger.info(f"[Qwen2] Updated parameters (first 10): {list(updated_param_names)[:10]}")
             
             return updated_param_names
 
@@ -632,12 +655,8 @@ class Qwen2ForCausalLM(nn.Module):
         try:
             from sglang.srt.model_loader.loader import QuantizedRLModelLoader
             
-            # Check for reload scenario: we have the original weights rebuild keys and recorded loaders
-            is_reload_scenario = (
-                hasattr(self, "original_weights_rebuild_keys") and 
-                hasattr(self, "recorded_loader") and
-                getattr(self, "process_weights_after_loading_already_called", False)
-            )
+            # Check for reload scenario using centralized logic
+            is_reload_scenario = QuantizedRLModelLoader.is_reload_scenario(self)
             
             if not is_reload_scenario:
                 logger.info("[QuantizedRL]: First load - use standard loading")

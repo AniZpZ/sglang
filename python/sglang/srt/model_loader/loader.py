@@ -509,22 +509,15 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _bond_method_to_cls(func, obj):
-        """Bind a function to an object instance, similar to Flash-RL's bond_method_to_cls."""
+        """Bind a function to an object instance, following Flash-RL's bond_method_to_cls approach."""
         import types
         
-        if func is None:
-            logger.warning("[QuantizedRL] Attempting to bind None function")
-            return None
-            
         if hasattr(func, '__self__') or not callable(func):
-            # If the function is already bound to an instance, return it as is
+            # If the function is already bound to an instance or not callable, return it as is
             return func
         else:
-            try:
-                return types.MethodType(func, obj)
-            except Exception as e:
-                logger.error(f"[QuantizedRL] Failed to bind method: {e}")
-                return func
+            # Bind the function to the object instance
+            return types.MethodType(func, obj)
 
 
     def _prepare_weights(
@@ -549,8 +542,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             )
             return
 
-        # Mark that we're in the initial loading phase
-        model._quantized_rl_initial_loading = True
 
         # Save original weight state for potential reloading
         if not hasattr(model, "original_weights_rebuild_keys"):
@@ -585,16 +576,21 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         for name, p in model.named_parameters():
             param_count += 1
             param_has_loader = False
+            param_loaders = []
             
             for key in recorded_loader_keys:
                 if hasattr(p, key):
                     param_has_loader = True
+                    param_loaders.append(key)
                     attr = getattr(p, key)
                     if not callable(attr):
+                        # Non-callable attributes (like dimensions)
                         recorded_loader[key][name] = attr
                     elif hasattr(attr, '__self__') and p is attr.__self__:
+                        # Bound method - store the unbound function for later rebinding (Flash-RL approach)
                         recorded_loader[key][name] = attr.__func__
                     else:
+                        # Regular function or callable - store as is
                         recorded_loader[key][name] = attr
             
             if param_has_loader:
@@ -628,17 +624,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Mark as already called to prevent duplicate processing
         model.process_weights_after_loading_already_called = True
         
-        # Clear the initial loading flag
-        if hasattr(model, "_quantized_rl_initial_loading"):
-            delattr(model, "_quantized_rl_initial_loading")
 
     @staticmethod
     def is_reload_scenario(model):
         """Check if this is a true reload scenario (not initial loading)."""
         return (
             hasattr(model, "original_weights_rebuild_keys") and 
-            getattr(model, "process_weights_after_loading_already_called", False) and
-            not getattr(model, "_quantized_rl_initial_loading", False)
+            hasattr(model, "recorded_loader") and
+            getattr(model, "process_weights_after_loading_already_called", False)
         )
 
     @staticmethod
@@ -670,7 +663,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """Reload weights with proper state management for multiple loading scenarios."""
+        logger.info("[QuantizedRL] Starting rebinding_and_load_weights process")
+        
         # Reset the model state to allow re-quantization
+        logger.info("[QuantizedRL] Resetting model weights state")
         QuantizedRLModelLoader.reset_model_weights_state(model)
 
         # Preserve workspace if exists
@@ -694,17 +690,45 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     dtype=rebuild_info["dtype"],
                     device=existing_params[name].device,
                 )
+            else:
+                logger.warning(f"[QuantizedRL] Parameter '{name}' not found during recovery, skipping")
 
-        # Restore weight loaders
+        # Restore weight loaders (following Flash-RL approach)
+        logger.info(f"[QuantizedRL] Starting weight loader restoration for {len(model.recorded_loader)} loader types")
+        restored_count = 0
         for k, loader_k in model.recorded_loader.items():
+            type_restored_count = 0
+            logger.info(f"[QuantizedRL] Restoring '{k}' loaders for {len(loader_k)} parameters")
             for n, loader in loader_k.items():
-                if not hasattr(existing_params[n], k):
-                    # Simple binding for now - in a full implementation you might need
-                    # a more sophisticated binding mechanism
+                if n not in existing_params:
+                    logger.warning(f"[QuantizedRL] Parameter '{n}' not found in existing_params, skipping '{k}' restoration")
+                    continue
+                
+                # Always use bond_method_to_cls for consistent binding (Flash-RL approach)
+                if callable(loader):
+                    bound_loader = QuantizedRLModelLoader._bond_method_to_cls(loader, existing_params[n])
+                    setattr(existing_params[n], k, bound_loader)
+                else:
+                    # Non-callable attribute (like dimensions)
                     setattr(existing_params[n], k, loader)
+                
+                type_restored_count += 1
+                restored_count += 1
+            
+            logger.info(f"[QuantizedRL] Restored {type_restored_count}/{len(loader_k)} '{k}' loaders")
+        
+        logger.info(f"[QuantizedRL] Total weight loaders restored: {restored_count}")
 
         # After recovering, the weight loading can be called as usual
-        updated_params = first_time_load_weights(weights)
+        logger.info("[QuantizedRL] Starting weight loading with restored loaders")
+        try:
+            updated_params = first_time_load_weights(weights)
+            logger.info(f"[QuantizedRL] Weight loading completed successfully, updated {len(updated_params)} parameters")
+            if len(updated_params) > 0:
+                logger.info(f"[QuantizedRL] Updated parameters: {list(updated_params)[:5]}...")  # Show first 5
+        except Exception as e:
+            logger.error(f"[QuantizedRL] Weight loading failed with restored loaders: {e}")
+            raise
 
         # Manually conducting process weights after loading
         # Note: We don't need to call load_weights_and_postprocess here because
@@ -720,6 +744,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         model.process_weights_after_loading_already_called = True
 
         # Put the value of the newly created tensor to the original tensor
+        logger.info(f"[QuantizedRL] Starting parameter restoration for {len(list(model.named_parameters()))} parameters")
+        restored_param_count = 0
         for name, p in model.named_parameters():
             assert (
                 name in original_param_dict
@@ -738,10 +764,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     original_param_dict[name].stride(),
                 )
                 original_param_dict[name].copy_(strided_data)
+                restored_param_count += 1
 
             # Restore the original tensor reference without deleting first
             p.data = original_param_dict[name]
+        
+        logger.info(f"[QuantizedRL] Parameter restoration completed: {restored_param_count}/{len(updated_params)} parameters restored with updated weights")
 
+        # Clean up references (Flash-RL approach)
         del original_param_dict
         del existing_params
         gc.collect()
