@@ -350,12 +350,14 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
-            tokenized_obj = self._tokenize_one_request(obj)
-
-            tokenized_obj.streaming_input = request['streaming_input']
+            if len(obj.image_data) == 0:
+                obj.input_ids=[151644, 872, 198, 56568, 101909, 15469, 110498, 1773, 107809, 100669, 87140, 3837, 111268, 33108, 108704, 31196, 62926, 66017, 105761, 33108, 108704, 1773, 151645, 271]
+            else:
+                obj.input_ids= [151679, 7, 151665, 1725, 151666, 8]
+            tokenized_obj = await self._tokenize_one_request(obj)
+            tokenized_obj.streaming_input = True
             tokenized_obj.commit = request['commit']
             self._send_one_request(obj, tokenized_obj, created_time, skip_state=True)
-
 
 
     async def generate_request(
@@ -386,12 +388,10 @@ class TokenizerManager:
             if is_single:
 
                 tokenized_obj = await self._tokenize_one_request(obj)
-
-                tokenized_obj.streaming_input = request['streaming_input']
-                tokenized_obj.commit = request['commit']
+                if self.server_args.enable_multimodal_streaming_input:
+                    tokenized_obj.streaming_input = request['streaming_input']
+                    tokenized_obj.commit = request['commit']
                 self._send_one_request(obj, tokenized_obj, created_time)
-                if request['streaming_input'] and not request['commit']:
-                    return
                 async for response in self._wait_one_response(obj, request):
                     yield response
             else:
@@ -506,7 +506,7 @@ class TokenizerManager:
         created_time: Optional[float] = None,
         skip_state: Optional[bool] = None,
     ):
-        if skip_state:
+        if not skip_state:
             state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
             self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
@@ -521,7 +521,7 @@ class TokenizerManager:
 
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                await asyncio.wait_for(state.event.wait(), timeout=40)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
                     self.abort_request(obj.rid)
@@ -558,15 +558,16 @@ class TokenizerManager:
 
             state.event.clear()
 
-            if obj.stream:
-                yield out
-            else:
-                if request is not None and await request.is_disconnected():
-                    self.abort_request(obj.rid)
-                    raise ValueError(
-                        "Request is disconnected from the client side. "
-                        f"Abort request {obj.rid}"
-                    )
+            # if obj.stream:
+            # print(out)
+            yield out
+            # else:
+            #     if request is not None and await request.is_disconnected():
+            #         self.abort_request(obj.rid)
+            #         raise ValueError(
+            #             "Request is disconnected from the client side. "
+            #             f"Abort request {obj.rid}"
+            #         )
 
     async def _handle_batch_request(
         self,

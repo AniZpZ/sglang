@@ -100,7 +100,6 @@ class Session:
         else:
             assert req_node.parent is None
             last_req = req_node.req
-            assert last_req.output_ids is None
 
             input_ids = last_req.origin_input_ids
             input_ids += req_input.input_ids

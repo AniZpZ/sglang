@@ -953,6 +953,8 @@ class Scheduler(
 
     def has_add_request_to_queue(self, new_req):
         has_add = False
+        if not self.server_args.enable_multimodal_streaming_input:
+            return has_add
         if len(self.streaming_input_prefill_batch) > 0:
             streaming_input_prefill_batch_temp = []
             for req in self.streaming_input_prefill_batch:
@@ -1288,14 +1290,15 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.streaming_input_prefill_batch is not None:
-            for streaming_input_req in self.streaming_input_prefill_batch:
-                streaming_input_req.init_next_round_input()
-                if streaming_input_req.extend_input_len == 0:
-                    continue
-                adder.add_one_req(streaming_input_req, False)
-                streaming_input_req.has_computed_package_size = len(
-                    streaming_input_req.multimodal_stream_inputs)
+        if self.server_args.enable_multimodal_streaming_input:
+            if self.streaming_input_prefill_batch is not None:
+                for streaming_input_req in self.streaming_input_prefill_batch:
+                    streaming_input_req.init_next_round_input()
+                    if streaming_input_req.extend_input_len == 0:
+                        continue
+                    adder.add_one_req(streaming_input_req, False)
+                    streaming_input_req.has_computed_package_size = len(
+                        streaming_input_req.multimodal_stream_inputs)
 
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])

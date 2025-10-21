@@ -37,7 +37,6 @@ async def streaming_input_handler(websocket):
         index += 1
         raw_data = await websocket.recv()
         raw_json = json.loads(raw_data)
-        print(raw_json)
         print(index)
         raw_json['request_id'] = session_id
 
@@ -51,12 +50,15 @@ async def streaming_input_handler(websocket):
         if "commit" in raw_json.keys() and raw_json["commit"]:
             raw_json['streaming_input'] = True
             raw_json['commit'] = True
-            await v1_chat_completions(_global_state.tokenizer_manager, raw_json)
-            #     await websocket.send(resp)
-            # break
+            raw_json['stream'] = True
+            async for resp in  v1_chat_completions(_global_state.tokenizer_manager, raw_json):
+                # print(resp)
+                await websocket.send(resp)
+            break
         else:
             raw_json['streaming_input'] = True
             raw_json['commit'] = False
+            raw_json['stream'] = True
             await v1_chat_completions_streaming(_global_state.tokenizer_manager, raw_json)
 
     close_session_obj = CloseSessionReqInput(session_id=open_session_obj.session_id)

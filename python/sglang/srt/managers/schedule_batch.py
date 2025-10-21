@@ -1467,7 +1467,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if r.multimodal_inputs is not None:
                 multimodal_inputs.append(r.multimodal_inputs)
             if r.multimodal_stream_inputs is not None:
-                multimodal_inputs.extend(r.multimodal_stream_inputs)
+                # 这个地方问题还很大，先这么处理
+                if len(r.multimodal_stream_inputs) > 0:
+                    multimodal_inputs.append(r.multimodal_stream_inputs[-1])
 
         return ModelWorkerBatch(
             bid=bid,
