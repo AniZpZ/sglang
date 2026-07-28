@@ -38,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    HYBRID = auto()
     NONE = auto()
 
     @classmethod
@@ -98,6 +99,7 @@ class SpeculativeAlgorithm(Enum):
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
+            SpeculativeAlgorithm.HYBRID,
         )
 
     def is_eagle3(self) -> bool:
@@ -115,6 +117,9 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_hybrid(self) -> bool:
+        return self == SpeculativeAlgorithm.HYBRID
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
@@ -127,7 +132,7 @@ class SpeculativeAlgorithm(Enum):
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
         states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
-        return self.is_eagle()
+        return self.is_eagle() or self.is_hybrid()
 
     def create_future_map(
         self,
@@ -157,7 +162,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_hybrid()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.
@@ -168,6 +173,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_dflash,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
+            _handle_hybrid,
             _handle_ngram,
         )
 
@@ -175,6 +181,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_dflash(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
+        elif self.is_hybrid():
+            _handle_hybrid(server_args)
         elif self.is_eagle() or self.is_standalone():
             _handle_eagle_family(server_args)
         elif self.is_ngram():
@@ -215,7 +223,11 @@ class SpeculativeAlgorithm(Enum):
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
-        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+        if self.is_hybrid():
+            from sglang.srt.speculative.hybrid_controller import HybridController
+
+            return HybridController
+        elif self.is_eagle() and server_args.enable_multi_layer_eagle:
             from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                 MultiLayerEagleWorkerV2,
             )

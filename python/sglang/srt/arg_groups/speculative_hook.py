@@ -405,6 +405,57 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_hybrid(server_args: ServerArgs) -> None:
+    if server_args.speculative_hybrid_config is None:
+        raise ValueError(
+            "HYBRID speculative decoding requires --speculative-hybrid-config."
+        )
+    try:
+        config = json.loads(server_args.speculative_hybrid_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--speculative-hybrid-config must be a JSON object.") from exc
+    if not isinstance(config, dict):
+        raise ValueError("--speculative-hybrid-config must be a JSON object.")
+
+    neural = config.get("neural")
+    if not isinstance(neural, dict):
+        return
+
+    # TokenizerManager and target memory-pool initialization run before the
+    # controller creates role-specific ServerArgs copies. Bootstrap EAGLE-only
+    # settings from the neural role, but size target verify buffers for the
+    # widest configured route. The controller captures a width-specific graph
+    # for every route over those shared buffers after worker initialization.
+    for field in (
+        "speculative_num_steps",
+        "speculative_eagle_topk",
+    ):
+        value = neural.get(field)
+        if value is not None:
+            setattr(server_args, field, value)
+
+    role_widths = [
+        config.get(role, {}).get("speculative_num_draft_tokens")
+        for role in ("retrieval", "neural")
+        if isinstance(config.get(role), dict)
+        and config[role].get("speculative_num_draft_tokens") is not None
+    ]
+    if role_widths and all(isinstance(width, int) for width in role_widths):
+        server_args.speculative_num_draft_tokens = max(role_widths)
+    elif neural.get("speculative_num_draft_tokens") is not None:
+        # Keep schema validation in HybridController; this branch only avoids
+        # making the bootstrap hook responsible for role-field validation.
+        server_args.speculative_num_draft_tokens = neural[
+            "speculative_num_draft_tokens"
+        ]
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for HYBRID speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+
 def _handle_ngram(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("Ngram speculative decoding only supports CUDA device.")

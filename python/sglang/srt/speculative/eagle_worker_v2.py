@@ -347,6 +347,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Create multi-step attn backends and cuda graph runners
 
         self.draft_extend_attn_backend = None
+        self._hybrid_draft_extend_widths = ()
+        self._hybrid_draft_extend_resources = {}
 
         draft_backend_factory = DraftBackendFactory(
             self.server_args,
@@ -367,6 +369,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+    def init_hybrid_draft_extend_widths(self, widths: tuple[int, ...]) -> None:
+        """Register all source verify widths that may restore neural state."""
+        self._hybrid_draft_extend_widths = tuple(sorted(set(widths)))
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -465,6 +471,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+
+        self._hybrid_draft_extend_resources = {
+            self.speculative_num_draft_tokens: (
+                self.draft_extend_attn_backend,
+                self.cuda_graph_runner_for_draft_extend,
+            )
+        }
+        if self.draft_extend_attn_backend is not None:
+            for width in self._hybrid_draft_extend_widths:
+                if width == self.speculative_num_draft_tokens:
+                    continue
+                backend = DraftBackendFactory(
+                    self.server_args,
+                    self.draft_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                ).create_draft_extend_backend()
+                graph_runner = None
+                if (
+                    _is_npu
+                    or supports_cuda_draft_extend_graph
+                    or supports_hip_aiter_draft_extend_graph
+                ):
+                    graph_runner = Device2ExtendCudaGraphRunner[self.target_worker.device](
+                        self,
+                        draft_extend_attn_backend=backend,
+                        num_tokens_per_bs=width,
+                    )
+                self._hybrid_draft_extend_resources[width] = (backend, graph_runner)
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
@@ -807,22 +842,44 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        source_draft_token_num: Optional[int] = None,
     ):
+        # The source verify tree defines the layout of hidden states and accept
+        # paths. It is not necessarily this EAGLE worker's next draft width.
+        source_draft_token_num = (
+            self.speculative_num_draft_tokens
+            if source_draft_token_num is None
+            else source_draft_token_num
+        )
+        if torch.any(batch_result.accept_lens > source_draft_token_num):
+            raise ValueError(
+                "Hybrid draft extend received accept_lens larger than source "
+                f"verify width {source_draft_token_num}."
+            )
+        draft_extend_attn_backend, cuda_graph_runner = (
+            self._hybrid_draft_extend_resources.get(
+                source_draft_token_num,
+                (
+                    self.draft_extend_attn_backend,
+                    self.cuda_graph_runner_for_draft_extend,
+                ),
+            )
+        )
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
-            # Draft-extend fills the whole tree width (num_draft_tokens) per req,
-            # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            num_tokens_per_req=source_draft_token_num,
+            num_tokens_for_logprob_per_req=source_draft_token_num,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
+            * source_draft_token_num
             + batch_result.accept_lens
             - 1
         )
@@ -831,48 +888,54 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
-        # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
-            forward_batch = self.prepare_for_draft_extend(
-                draft_extend_input,
-                batch,
-                next_token_ids,
-                self.speculative_num_draft_tokens,
-                self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
-            )
+        # The eager forward builds metadata from the active runner backend;
+        # switch to the resource whose width matches the source verify tree.
+        previous_attn_backend = self.draft_runner.attn_backend
+        if draft_extend_attn_backend is not None:
+            self.draft_runner.attn_backend = draft_extend_attn_backend
 
-        if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
-
-        # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
-        )
-
-        canary_ctx = (
-            context_tuple(
-                c.with_ops_outside_graph(
-                    single_forward_indices=[0],
-                    maybe_inaccurate_forward_batch=forward_batch,
-                ),
-                c.with_active_single_forward_manager(0),
-            )
-            if (c := self.draft_runner.canary_manager) is not None
-            else contextlib.nullcontext()
-        )
-        with canary_ctx:
-            if can_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+        try:
+            # Prepare for draft extend in a separate stream
+            with self.plan_stream_ctx:
+                forward_batch = self.prepare_for_draft_extend(
+                    draft_extend_input,
+                    batch,
+                    next_token_ids,
+                    source_draft_token_num,
+                    self.draft_runner,
+                    cuda_graph_runner,
                 )
-            else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+
+            if self.plan_stream:
+                torch.get_device_module(self.device).current_stream().wait_stream(
+                    self.plan_stream
+                )
+
+            # Run draft extend batch in the main compute stream
+            can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+                forward_batch
+            )
+
+            canary_ctx = (
+                context_tuple(
+                    c.with_ops_outside_graph(
+                        single_forward_indices=[0],
+                        maybe_inaccurate_forward_batch=forward_batch,
+                    ),
+                    c.with_active_single_forward_manager(0),
+                )
+                if (c := self.draft_runner.canary_manager) is not None
+                else contextlib.nullcontext()
+            )
+            with canary_ctx:
+                if can_cuda_graph:
+                    draft_logits_output = cuda_graph_runner.execute(forward_batch)
+                else:
+                    draft_logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
+        finally:
+            self.draft_runner.attn_backend = previous_attn_backend
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -1002,12 +1065,58 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        hybrid_extend_backends = tuple(
+            backend
+            for backend, _ in self._draft_worker._hybrid_draft_extend_resources.values()
+            if backend is not None
+        )
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
-            self._draft_worker.draft_extend_attn_backend
-            or self._draft_worker.draft_runner.attn_backend,
+            *hybrid_extend_backends,
         )
+
+    def init_hybrid_draft_extend_widths(self, widths: tuple[int, ...]) -> None:
+        self._draft_worker.init_hybrid_draft_extend_widths(widths)
+
+    def init_hybrid_target_verify_widths(self, widths: tuple[int, ...]) -> None:
+        """Capture one target-verify graph per route width over shared buffers."""
+        target_runner = self._target_worker.model_runner
+        primary_graph_runner = target_runner.decode_cuda_graph_runner
+        # Platform-specific runners that cannot expose DecodeInputBuffers do
+        # not support cross-width buffer sharing. Keep their existing graph.
+        if primary_graph_runner is None or not hasattr(primary_graph_runner, "buffers"):
+            return
+        max_width = max(widths)
+        primary_width = target_runner.server_args.speculative_num_draft_tokens
+        if primary_width != max_width:
+            raise ValueError(
+                "HYBRID target bootstrap width must be the maximum route width: "
+                f"bootstrap={primary_width}, maximum={max_width}."
+            )
+        # Each target-verify capture owns its shape-specific static input,
+        # custom-mask, logits and attention-backend state. CUDA graph capture
+        # records these tensor addresses, so a narrower route must not alias a
+        # widest-route DecodeInputBuffers object merely because its capacity is
+        # sufficient. Memory-pool/KV storage remains shared by the workers.
+        target_runner.hybrid_target_verify_graph_runners = {
+            primary_width: primary_graph_runner
+        }
+        for width in sorted(set(widths)):
+            if width == primary_width:
+                continue
+            # Each graph owns shape-specific attention metadata and capture
+            # buffers such as custom_mask and logits. The standard input-buffer
+            # pool still aliases compatible base tensors, but never forces a
+            # width-4 graph to read a width-6 static custom mask.
+            target_attn_backend = target_runner._get_attention_backend(
+                init_new_workspace=True
+            )
+            target_runner.hybrid_target_verify_graph_runners[width] = DecodeCudaGraphRunner(
+                target_runner,
+                attn_backend=target_attn_backend,
+                speculative_num_draft_tokens=width,
+            )
 
     def alloc_memory_pool(
         self,
@@ -1157,6 +1266,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def update_runtime_state_from_hybrid(
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        bonus_tokens: torch.Tensor,
+        source_draft_token_num: int | None = None,
+    ) -> None:
+        batch_result.next_draft_input = EagleDraftInput(
+            bonus_tokens=bonus_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        self.draft_worker._draft_extend_for_decode(
+            batch, batch_result, source_draft_token_num=source_draft_token_num
+        )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

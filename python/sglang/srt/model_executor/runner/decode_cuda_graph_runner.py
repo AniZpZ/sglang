@@ -175,6 +175,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        buffer_num_tokens_per_bs: Optional[int] = None,
+        shared_buffers: Optional[DecodeInputBuffers] = None,
     ):
         super().__init__(model_runner)
         # --- core state ------------------------------------------------
@@ -226,6 +228,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
+        self.buffer_num_tokens_per_bs_override = buffer_num_tokens_per_bs
 
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
@@ -258,9 +261,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
+        self.buffer_num_tokens_per_bs = (
+            self.num_tokens_per_bs
+            if self.buffer_num_tokens_per_bs_override is None
+            else self.buffer_num_tokens_per_bs_override
+        )
+        if self.buffer_num_tokens_per_bs < self.num_tokens_per_bs:
+            raise ValueError(
+                "target verify graph buffer width must cover its graph width: "
+                f"buffer={self.buffer_num_tokens_per_bs}, graph={self.num_tokens_per_bs}"
+            )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        # The buffer capacity may be wider than this route, but attention graph
+        # state (notably verify-tree metadata) must use the route's logical
+        # width. Otherwise a width-4 graph gets metadata arrays laid out as
+        # width-6 and can dereference invalid tree indices during capture.
+        self.graph_max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.buffer_num_tokens_per_bs
+        self.attn_backend.init_cuda_graph_state(self.max_bs, self.graph_max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -298,31 +316,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         # --- buffers ---------------------------------------------------
-        self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
-            device=self.device,
-            max_bs=self.max_bs,
-            max_num_token=self.max_num_token,
-            hidden_size=self.model_runner.model_config.hidden_size,
-            vocab_size=self.model_runner.model_config.vocab_size,
-            dtype=self.model_runner.model_config.dtype,
-            dp_size=self.dp_size,
-            pp_size=self.pp_size,
-            is_encoder_decoder=self.is_encoder_decoder,
-            require_mlp_tp_gather=self.require_mlp_tp_gather,
-            seq_len_fill_value=self.seq_len_fill_value,
-            encoder_len_fill_value=self.encoder_len_fill_value,
-            num_tokens_per_bs=self.num_tokens_per_bs,
-            cache_loc_dtype=self._cache_loc_dtype(),
-            enable_mamba_track=enable_mamba_track,
-            ne_token_table=(
-                model_runner.token_table if self.use_ngram_embedding else None
-            ),
-            hc_hidden_size=getattr(
-                self.model_runner.model_config, "hc_hidden_size", None
-            ),
-            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
-        )
-        self.buffers.share_buffers()
+        if shared_buffers is None:
+            self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
+                device=self.device,
+                max_bs=self.max_bs,
+                max_num_token=self.max_num_token,
+                hidden_size=self.model_runner.model_config.hidden_size,
+                vocab_size=self.model_runner.model_config.vocab_size,
+                dtype=self.model_runner.model_config.dtype,
+                dp_size=self.dp_size,
+                pp_size=self.pp_size,
+                is_encoder_decoder=self.is_encoder_decoder,
+                require_mlp_tp_gather=self.require_mlp_tp_gather,
+                seq_len_fill_value=self.seq_len_fill_value,
+                encoder_len_fill_value=self.encoder_len_fill_value,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+                cache_loc_dtype=self._cache_loc_dtype(),
+                enable_mamba_track=enable_mamba_track,
+                ne_token_table=(
+                    model_runner.token_table if self.use_ngram_embedding else None
+                ),
+                hc_hidden_size=getattr(
+                    self.model_runner.model_config, "hc_hidden_size", None
+                ),
+                pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            )
+            self.buffers.share_buffers()
+        else:
+            self.buffers = shared_buffers
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -821,8 +842,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     shape_key,
                     run_once,
                     dummies=None,
+                    # `attn_backend` is route/shape specific for HYBRID.
+                    # It is the instance that initialized the capture metadata
+                    # above and therefore must undo warmup state as well.
                     post_warmup_hook=getattr(
-                        self.model_runner.attn_backend,
+                        attn_backend,
                         "on_after_cuda_graph_warmup",
                         None,
                     ),
@@ -1025,6 +1049,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_hybrid()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

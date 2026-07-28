@@ -31,7 +31,10 @@ def decide_needs_cpu_seq_lens(
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    if SpeculativeAlgorithm.from_string(server_args.speculative_algorithm).is_ngram():
+    spec_algorithm = SpeculativeAlgorithm.from_string(
+        server_args.speculative_algorithm
+    )
+    if spec_algorithm.is_ngram() or spec_algorithm.is_hybrid():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
@@ -154,6 +157,7 @@ class FutureMap:
             spec_need_hidden_states()
             and getattr(draft_input, "hidden_states", None) is not None
         )
+        self.need_accept_path = False
 
         if self.need_verified_id:
             verified_id0 = draft_input.verified_id[0]
@@ -191,7 +195,6 @@ class FutureMap:
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
-
         self.draft_probs_buf = None
         if getattr(draft_input, "draft_probs", None) is not None:
             draft_probs0 = draft_input.draft_probs[0]
@@ -200,6 +203,21 @@ class FutureMap:
                 dtype=draft_probs0.dtype,
                 device=self.device,
             )
+
+    def _ensure_accept_path_buffers(self, draft_input) -> None:
+        if self.need_accept_path or draft_input.accept_tokens is None:
+            return
+        self.need_accept_path = True
+        self.accept_tokens_buf = torch.empty(
+            (self.req_pool_size, draft_input.accept_tokens.shape[1]),
+            dtype=draft_input.accept_tokens.dtype,
+            device=self.device,
+        )
+        self.accept_lens_buf = torch.empty(
+            (self.req_pool_size,),
+            dtype=draft_input.accept_lens.dtype,
+            device=self.device,
+        )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
@@ -247,6 +265,9 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+        if self.need_accept_path:
+            draft_input.accept_tokens = self.accept_tokens_buf[indices]
+            draft_input.accept_lens = self.accept_lens_buf[indices]
         if _DEBUG_ASSERT:
             if self.need_verified_id:
                 _assert_nonneg_and_invalidate(
@@ -362,6 +383,15 @@ class FutureMap:
         if self.need_hidden_states:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
+            )
+        if self.spec_algo.is_hybrid():
+            self._ensure_accept_path_buffers(draft_input)
+        if self.need_accept_path:
+            self.accept_tokens_buf[indices] = draft_input.accept_tokens.to(
+                self.accept_tokens_buf.dtype
+            )
+            self.accept_lens_buf[indices] = draft_input.accept_lens.to(
+                self.accept_lens_buf.dtype
             )
         if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
             self.draft_probs_buf[indices] = draft_input.draft_probs

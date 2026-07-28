@@ -25,6 +25,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
+        accept_width: Optional[int] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -41,6 +42,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         self.new_seq_lens = new_seq_lens
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
+        self.accept_width = accept_width or draft_token_num
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
@@ -128,7 +130,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         ]
         self.accept_tokens = self.accept_tokens.flatten()
         self.accept_lens = self.accept_lens[new_indices]
-
     def merge_batch(self, spec_info: NgramVerifyInput):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

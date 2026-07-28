@@ -335,18 +335,24 @@ def eagle_prepare_for_verify(
     batch.capture_hidden_mode = capture_mode
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-    # Run attention backend plan and cuda graph preparation
+    # Hybrid captures one target-verify graph per configured source width.
+    # The runners reuse physical buffers sized to the widest route while their
+    # attention metadata and replay graph remain shape-specific.
+    target_graph_runners = getattr(
+        target_worker.model_runner, "hybrid_target_verify_graph_runners", None
+    )
+    cuda_graph_runner = (
+        target_graph_runners.get(verify_input.draft_token_num)
+        if target_graph_runners is not None
+        else target_worker.model_runner.decode_cuda_graph_runner
+    )
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-            verify_forward_batch
-        )
+        cuda_graph_runner and cuda_graph_runner.can_run_graph(verify_forward_batch)
     )
     if can_run_cuda_graph:
-        target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-            verify_forward_batch
-        )
+        cuda_graph_runner.load_batch(verify_forward_batch)
         verify_forward_batch.mark_forward_metadata_ready()
+        verify_forward_batch.cuda_graph_runner = cuda_graph_runner
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.

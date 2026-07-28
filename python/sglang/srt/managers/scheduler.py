@@ -811,13 +811,17 @@ class Scheduler(
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
-        if self.spec_algorithm.is_ngram():
+        if self.spec_algorithm.is_ngram() or self.spec_algorithm.is_hybrid():
             from sglang.srt.speculative.external_corpus_manager import (
                 ExternalCorpusManager,
             )
 
             self.external_corpus_manager = ExternalCorpusManager(
-                self.draft_worker,
+                (
+                    self.draft_worker.retrieval_worker
+                    if self.spec_algorithm.is_hybrid()
+                    else self.draft_worker
+                ),
                 self.ipc_channels.send_to_tokenizer.send_output,
             )
         else:

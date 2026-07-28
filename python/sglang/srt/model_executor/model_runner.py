@@ -3001,10 +3001,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
+            cuda_graph_runner = getattr(
+                forward_batch, "cuda_graph_runner", self.decode_cuda_graph_runner
+            )
             can_run_graph = bool(
-                mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                not getattr(forward_batch, "disable_cuda_graph", False)
+                and mode_check()
+                and cuda_graph_runner
+                and cuda_graph_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -3017,7 +3021,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
+                cuda_graph_runner = getattr(
+                    forward_batch, "cuda_graph_runner", self.decode_cuda_graph_runner
+                )
+                ret = cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )

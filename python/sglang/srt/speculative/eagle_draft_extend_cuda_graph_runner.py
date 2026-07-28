@@ -80,6 +80,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        num_tokens_per_bs: Optional[int] = None,
+        buffer_num_tokens_per_bs: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -106,6 +108,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if speculative_num_steps is None
             else speculative_num_steps
         )
+        self.num_tokens_per_bs_override = num_tokens_per_bs
+        self.buffer_num_tokens_per_bs_override = buffer_num_tokens_per_bs
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
@@ -128,12 +132,28 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not
         # num_steps + 1, or topk > 1 draft-extend overflows them.
-        self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
+        self.num_tokens_per_bs = (
+            model_runner.server_args.speculative_num_draft_tokens
+            if self.num_tokens_per_bs_override is None
+            else self.num_tokens_per_bs_override
+        )
+        self.buffer_num_tokens_per_bs = (
+            self.num_tokens_per_bs
+            if self.buffer_num_tokens_per_bs_override is None
+            else self.buffer_num_tokens_per_bs_override
+        )
+        if self.buffer_num_tokens_per_bs < self.num_tokens_per_bs:
+            raise ValueError(
+                "draft-extend buffer width must cover its graph width: "
+                f"buffer={self.buffer_num_tokens_per_bs}, graph={self.num_tokens_per_bs}"
+            )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.buffer_num_tokens_per_bs
 
+        # Input buffers may be sized for another Hybrid route, but this
+        # backend's graph metadata must follow this runner's logical width.
         self.draft_extend_attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
+            self.max_bs, self.max_bs * self.num_tokens_per_bs
         )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -213,7 +233,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = torch.zeros(
                 (
-                    self.max_bs * self.num_tokens_per_bs,
+                    self.max_bs * self.buffer_num_tokens_per_bs,
                     vocab_size,
                 ),
                 dtype=torch.float,

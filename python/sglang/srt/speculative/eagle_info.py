@@ -176,6 +176,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # chain); the worker copies it here post-extend for next iter's draft.
     bonus_tokens: torch.Tensor = None
 
+    # Hybrid-only relay for a retrieval worker that needs the complete target
+    # accepted path while req.output_ids is one overlap iteration behind.
+    # FutureMap stores these pool-indexed and restores them with this input.
+    accept_tokens: torch.Tensor = None
+    accept_lens: torch.Tensor = None
+    accept_width: int = None
+
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
@@ -258,6 +265,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if self.accept_tokens is not None:
+                self.accept_tokens = self.accept_tokens[: len(new_indices)]
+                self.accept_lens = self.accept_lens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -267,6 +277,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.accept_tokens is not None:
+                self.accept_tokens = self.accept_tokens[new_indices]
+                self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -282,6 +295,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
+            self.accept_tokens = spec_info.accept_tokens
+            self.accept_lens = spec_info.accept_lens
+            self.accept_width = spec_info.accept_width
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
@@ -295,6 +311,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
+        if self.accept_tokens is not None and spec_info.accept_tokens is not None:
+            assert self.accept_width == spec_info.accept_width
+            self.accept_tokens = torch.cat(
+                [self.accept_tokens, spec_info.accept_tokens], axis=0
+            )
+            self.accept_lens = torch.cat(
+                [self.accept_lens, spec_info.accept_lens], axis=0
+            )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
         if self.draft_probs is not None and spec_info.draft_probs is not None:

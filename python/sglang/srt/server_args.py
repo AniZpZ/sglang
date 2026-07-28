@@ -1445,7 +1445,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, HYBRID, DFLASH. HYBRID routes each batch between EAGLE and NGRAM. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1548,6 +1548,10 @@ class ServerArgs:
     speculative_adaptive_config: A[
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+    ] = None
+    speculative_hybrid_config: A[
+        Optional[str],
+        "HYBRID only. JSON object declaring retrieval and neural workers. Each role contains algorithm plus ServerArgs overrides directly; optional min_continuation_ratio and min_matching_ratio control batch-level routing.",
     ] = None
 
     # -------------------------------------------------------------------------
