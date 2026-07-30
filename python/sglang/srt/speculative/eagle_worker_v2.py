@@ -71,6 +71,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_target_verify_attn_backend,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
@@ -551,8 +552,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
+        target_attn_backend = get_target_verify_attn_backend(
+            self.target_worker, self.speculative_num_draft_tokens
+        )
         tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+            target_attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
         # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
@@ -1083,10 +1087,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Capture one target-verify graph per route width over shared buffers."""
         target_runner = self._target_worker.model_runner
         primary_graph_runner = target_runner.decode_cuda_graph_runner
-        # Platform-specific runners that cannot expose DecodeInputBuffers do
-        # not support cross-width buffer sharing. Keep their existing graph.
-        if primary_graph_runner is None or not hasattr(primary_graph_runner, "buffers"):
-            return
         max_width = max(widths)
         primary_width = target_runner.server_args.speculative_num_draft_tokens
         if primary_width != max_width:
@@ -1099,24 +1099,49 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # records these tensor addresses, so a narrower route must not alias a
         # widest-route DecodeInputBuffers object merely because its capacity is
         # sufficient. Memory-pool/KV storage remains shared by the workers.
+        # Eager target verify still requires width-specific attention metadata.
+        # Graph capture is optional: when disabled, retain a ``None`` runner but
+        # build and activate the matching backend at every route boundary.
+        primary_attn_backend = (
+            primary_graph_runner.attn_backend
+            if primary_graph_runner is not None
+            else target_runner.attn_backend
+        )
         target_runner.hybrid_target_verify_graph_runners = {
             primary_width: primary_graph_runner
+        }
+        target_runner.hybrid_target_verify_attn_backends = {
+            primary_width: primary_attn_backend
         }
         for width in sorted(set(widths)):
             if width == primary_width:
                 continue
-            # Each graph owns shape-specific attention metadata and capture
-            # buffers such as custom_mask and logits. The standard input-buffer
-            # pool still aliases compatible base tensors, but never forces a
-            # width-4 graph to read a width-6 static custom mask.
-            target_attn_backend = target_runner._get_attention_backend(
-                init_new_workspace=True
-            )
-            target_runner.hybrid_target_verify_graph_runners[width] = DecodeCudaGraphRunner(
-                target_runner,
-                attn_backend=target_attn_backend,
-                speculative_num_draft_tokens=width,
-            )
+            # Attention backends derive verify-tree layout from ServerArgs at
+            # construction time (for example, FlashAttention stores
+            # `speculative_num_draft_tokens`). Build this backend under the
+            # route width rather than inheriting the bootstrap widest width.
+            bootstrap_width = target_runner.server_args.speculative_num_draft_tokens
+            bootstrap_workspace = target_runner.init_new_workspace
+            try:
+                target_runner.server_args.speculative_num_draft_tokens = width
+                target_attn_backend = target_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_runner.server_args.speculative_num_draft_tokens = bootstrap_width
+                target_runner.init_new_workspace = bootstrap_workspace
+            # CUDA graph runners need independent static buffers. Build one
+            # only when the bootstrap route captured a compatible graph;
+            # otherwise eager execution uses the backend map above.
+            target_graph_runner = None
+            if primary_graph_runner is not None and hasattr(primary_graph_runner, "buffers"):
+                target_graph_runner = DecodeCudaGraphRunner(
+                    target_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_draft_tokens=width,
+                )
+            target_runner.hybrid_target_verify_graph_runners[width] = target_graph_runner
+            target_runner.hybrid_target_verify_attn_backends[width] = target_attn_backend
 
     def alloc_memory_pool(
         self,
@@ -1176,6 +1201,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def _set_next_input_accept_path(
+        self,
+        batch: ScheduleBatch,
+        next_draft_input: EagleDraftInput,
+        accept_tokens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        accept_width: int,
+    ) -> None:
+        """Populate the worker-owned accepted path on the next VerifyInput."""
+        # NGRAM consumes this complete path on CPU, so keep it attached to
+        # VerifyInput in producer row order. Do not pad or relay it through
+        # FutureMap: FutureMap is reserved for EAGLE's GPU draft state.
+        next_draft_input.accept_tokens = accept_tokens
+        next_draft_input.accept_lens = accept_lens
+        next_draft_input.accept_width = accept_width
+        next_draft_input.accept_buffer_width = accept_width
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1211,7 +1253,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
-                return batch_output
+            self._set_next_input_accept_path(
+                batch,
+                batch_output.next_draft_input,
+                batch_output.next_token_ids.reshape(len(batch.reqs), 1),
+                torch.ones(
+                    len(batch.reqs),
+                    dtype=torch.int32,
+                    device=batch_output.next_token_ids.device,
+                ),
+                accept_width=1,
+            )
+            return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1274,10 +1327,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         source_draft_token_num: int | None = None,
     ) -> None:
+        # Keep the source verify path for a future NGRAM CPU lookup. The new
+        # EAGLE draft input only needs ``bonus_tokens`` as GPU state, but
+        # replacing the accepted path with that bonus would break a subsequent
+        # neural -> retrieval route switch.
+        source_input = batch_result.next_draft_input
+        source_accept_tokens = source_input.accept_tokens
+        source_accept_lens = source_input.accept_lens
+        source_accept_width = source_input.accept_width
+        source_accept_buffer_width = source_input.accept_buffer_width
         batch_result.next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
+        batch_result.next_draft_input.accept_tokens = source_accept_tokens
+        batch_result.next_draft_input.accept_lens = source_accept_lens
+        batch_result.next_draft_input.accept_width = source_accept_width
+        batch_result.next_draft_input.accept_buffer_width = source_accept_buffer_width
         self.draft_worker._draft_extend_for_decode(
             batch, batch_result, source_draft_token_num=source_draft_token_num
         )
@@ -1366,6 +1432,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=EagleDraftInput.dtype_for(self.draft_worker),
                 device=device,
             )
+        # Hybrid FutureMap needs accept path even when draft_extend is skipped.
+        self._set_next_input_accept_path(
+            batch,
+            next_draft_input,
+            next_draft_input.bonus_tokens.reshape(bs, 1),
+            torch.ones(bs, dtype=torch.int32, device=device),
+            accept_width=1,
+        )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -1594,10 +1668,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
             # computation again to update them to the correct values.
-            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+            target_attn_backend = get_target_verify_attn_backend(
+                self.target_worker, verify_input.draft_token_num
+            )
+            target_attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
+                    verify_forward_batch.cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
@@ -1689,6 +1766,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+        self._set_next_input_accept_path(
+            batch,
+            next_draft_input,
+            predict.view(bs, self.speculative_num_draft_tokens),
+            accept_lens,
+            accept_width=self.speculative_num_draft_tokens,
+        )
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent

@@ -182,6 +182,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     accept_tokens: torch.Tensor = None
     accept_lens: torch.Tensor = None
     accept_width: int = None
+    accept_buffer_width: int = None
 
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
@@ -239,12 +240,25 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 if get_global_server_args().speculative_use_rejection_sampling
                 else None
             ),
+            accept_tokens=torch.empty((0, 1), device=device, dtype=torch.int32),
+            accept_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_width=1,
+            accept_buffer_width=1,
             capture_hidden_mode=capture_hidden_mode,
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            # FutureMap owns EAGLE's GPU draft state, but Hybrid's accepted
+            # path belongs to NGRAM's CPU lookup protocol. Keep the latter
+            # positional and filter it like native NGRAM instead of routing it
+            # through the GPU relay.
+            if self.accept_tokens is not None:
+                self.accept_tokens = self.accept_tokens[new_indices]
+                self.accept_lens = self.accept_lens[new_indices]
+                if isinstance(self.accept_width, torch.Tensor):
+                    self.accept_width = self.accept_width[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -287,6 +301,45 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            # The GPU draft state is restored by FutureMap, while accepted
+            # paths are D2H-consumed by NGRAM and must retain normal batch-row
+            # merge semantics.
+            if self.accept_tokens is not None and spec_info.accept_tokens is not None:
+                self_width = self.accept_buffer_width or self.accept_tokens.shape[1]
+                other_width = (
+                    spec_info.accept_buffer_width or spec_info.accept_tokens.shape[1]
+                )
+                merged_width = max(self_width, other_width)
+                self_tokens = self.accept_tokens.reshape(-1, self_width)
+                other_tokens = spec_info.accept_tokens.reshape(-1, other_width)
+                if self_width < merged_width:
+                    self_tokens = torch.nn.functional.pad(
+                        self_tokens, (0, merged_width - self_width)
+                    )
+                if other_width < merged_width:
+                    other_tokens = torch.nn.functional.pad(
+                        other_tokens, (0, merged_width - other_width)
+                    )
+                self.accept_tokens = torch.cat([self_tokens, other_tokens], axis=0)
+                self.accept_lens = torch.cat(
+                    [self.accept_lens, spec_info.accept_lens], axis=0
+                )
+                self.accept_buffer_width = merged_width
+                self.accept_width = torch.cat(
+                    [
+                        torch.as_tensor(
+                            self.accept_width,
+                            dtype=torch.int32,
+                            device=self.accept_lens.device,
+                        ).expand(self_tokens.shape[0]),
+                        torch.as_tensor(
+                            spec_info.accept_width,
+                            dtype=torch.int32,
+                            device=self.accept_lens.device,
+                        ).expand(other_tokens.shape[0]),
+                    ],
+                    dim=0,
+                )
             return
 
         # Detect idle stub by `topk_index` length (idle inputs have
@@ -298,6 +351,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.accept_tokens = spec_info.accept_tokens
             self.accept_lens = spec_info.accept_lens
             self.accept_width = spec_info.accept_width
+            self.accept_buffer_width = spec_info.accept_buffer_width
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
@@ -312,12 +366,38 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
         if self.accept_tokens is not None and spec_info.accept_tokens is not None:
-            assert self.accept_width == spec_info.accept_width
-            self.accept_tokens = torch.cat(
-                [self.accept_tokens, spec_info.accept_tokens], axis=0
-            )
+            self_width = self.accept_buffer_width or self.accept_tokens.shape[1]
+            other_width = spec_info.accept_buffer_width or spec_info.accept_tokens.shape[1]
+            merged_width = max(self_width, other_width)
+            self_tokens = self.accept_tokens.reshape(-1, self_width)
+            other_tokens = spec_info.accept_tokens.reshape(-1, other_width)
+            if self_width < merged_width:
+                self_tokens = torch.nn.functional.pad(
+                    self_tokens, (0, merged_width - self_width)
+                )
+            if other_width < merged_width:
+                other_tokens = torch.nn.functional.pad(
+                    other_tokens, (0, merged_width - other_width)
+                )
+            self.accept_tokens = torch.cat([self_tokens, other_tokens], axis=0)
             self.accept_lens = torch.cat(
                 [self.accept_lens, spec_info.accept_lens], axis=0
+            )
+            self.accept_buffer_width = merged_width
+            self.accept_width = torch.cat(
+                [
+                    torch.as_tensor(
+                        self.accept_width,
+                        dtype=torch.int32,
+                        device=self.accept_lens.device,
+                    ).expand(self_tokens.shape[0]),
+                    torch.as_tensor(
+                        spec_info.accept_width,
+                        dtype=torch.int32,
+                        device=self.accept_lens.device,
+                    ).expand(other_tokens.shape[0]),
+                ],
+                dim=0,
             )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])

@@ -62,8 +62,14 @@ class EagerRunner(BaseRunner):
         # input pool; size to the largest tokens/req across modes the worker hits.
         num_tokens_per_bs = 1
         if mr.spec_algorithm.is_speculative():
-            # speculative_adaptive can grow draft tokens at runtime; size to the max.
-            num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
+            # speculative_adaptive can grow draft tokens at runtime; otherwise
+            # the configured source verify width is still required for eager
+            # NGRAM/HYBRID target-verify input buffers.
+            num_draft_tokens = (
+                sa.max_speculative_num_draft_tokens
+                or sa.speculative_num_draft_tokens
+                or 1
+            )
             if mr.is_draft_worker:
                 num_tokens_per_bs = max(
                     sa.speculative_eagle_topk or 1,

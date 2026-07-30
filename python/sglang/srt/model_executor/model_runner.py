@@ -455,7 +455,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 )
 
-            if self.spec_algorithm.is_eagle3():
+            if self.spec_algorithm.is_eagle3() or getattr(
+                server_args, "hybrid_neural_is_eagle3", False
+            ):
                 self.eagle_use_aux_hidden_state = True
                 try:
                     eagle_config = getattr(

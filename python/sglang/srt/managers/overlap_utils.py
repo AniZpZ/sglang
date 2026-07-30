@@ -157,7 +157,6 @@ class FutureMap:
             spec_need_hidden_states()
             and getattr(draft_input, "hidden_states", None) is not None
         )
-        self.need_accept_path = False
 
         if self.need_verified_id:
             verified_id0 = draft_input.verified_id[0]
@@ -203,21 +202,6 @@ class FutureMap:
                 dtype=draft_probs0.dtype,
                 device=self.device,
             )
-
-    def _ensure_accept_path_buffers(self, draft_input) -> None:
-        if self.need_accept_path or draft_input.accept_tokens is None:
-            return
-        self.need_accept_path = True
-        self.accept_tokens_buf = torch.empty(
-            (self.req_pool_size, draft_input.accept_tokens.shape[1]),
-            dtype=draft_input.accept_tokens.dtype,
-            device=self.device,
-        )
-        self.accept_lens_buf = torch.empty(
-            (self.req_pool_size,),
-            dtype=draft_input.accept_lens.dtype,
-            device=self.device,
-        )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
@@ -265,9 +249,6 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
-        if self.need_accept_path:
-            draft_input.accept_tokens = self.accept_tokens_buf[indices]
-            draft_input.accept_lens = self.accept_lens_buf[indices]
         if _DEBUG_ASSERT:
             if self.need_verified_id:
                 _assert_nonneg_and_invalidate(
@@ -371,7 +352,12 @@ class FutureMap:
                 self.verified_id_buf.dtype
             )
         if self.need_bonus_tokens:
-            self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            bonus_tokens = getattr(draft_input, "bonus_tokens", None)
+            if bonus_tokens is None:
+                raise ValueError(
+                    "Hybrid FutureMap requires the producer to provide bonus_tokens."
+                )
+            self.output_tokens_buf[indices] = bonus_tokens.to(
                 self.output_tokens_buf.dtype
             )
 
@@ -383,15 +369,6 @@ class FutureMap:
         if self.need_hidden_states:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
-            )
-        if self.spec_algo.is_hybrid():
-            self._ensure_accept_path_buffers(draft_input)
-        if self.need_accept_path:
-            self.accept_tokens_buf[indices] = draft_input.accept_tokens.to(
-                self.accept_tokens_buf.dtype
-            )
-            self.accept_lens_buf[indices] = draft_input.accept_lens.to(
-                self.accept_lens_buf.dtype
             )
         if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
             self.draft_probs_buf[indices] = draft_input.draft_probs

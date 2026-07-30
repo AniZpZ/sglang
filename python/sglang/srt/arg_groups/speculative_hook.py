@@ -429,11 +429,22 @@ def _handle_hybrid(server_args: ServerArgs) -> None:
     for field in (
         "speculative_num_steps",
         "speculative_eagle_topk",
+        "speculative_num_draft_tokens",
+        "speculative_draft_model_path",
+        "speculative_draft_model_revision",
     ):
         value = neural.get(field)
         if value is not None:
             setattr(server_args, field, value)
 
+    # The target ModelRunner is constructed before HybridController creates
+    # role-specific ServerArgs. Preserve the neural EAGLE3 identity so its
+    # auxiliary hidden-state outputs are enabled before CUDA graph capture.
+    server_args.hybrid_neural_is_eagle3 = neural.get("algorithm", "").upper() == "EAGLE3"
+
+    # The initial target verify graph supplies the largest shared static
+    # buffers. Route-specific graphs and attention metadata are created later
+    # by HybridController, but this bootstrap width must cover NGRAM too.
     role_widths = [
         config.get(role, {}).get("speculative_num_draft_tokens")
         for role in ("retrieval", "neural")
@@ -442,12 +453,7 @@ def _handle_hybrid(server_args: ServerArgs) -> None:
     ]
     if role_widths and all(isinstance(width, int) for width in role_widths):
         server_args.speculative_num_draft_tokens = max(role_widths)
-    elif neural.get("speculative_num_draft_tokens") is not None:
-        # Keep schema validation in HybridController; this branch only avoids
-        # making the bootstrap hook responsible for role-field validation.
-        server_args.speculative_num_draft_tokens = neural[
-            "speculative_num_draft_tokens"
-        ]
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(

@@ -278,6 +278,25 @@ def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
     return model_runner.model_config.spec_hidden_size
 
 
+def get_target_verify_attn_backend(
+    target_worker: TpModelWorker, draft_token_num: int
+):
+    """Return the attention backend paired with a Hybrid verify width.
+
+    Hybrid owns one target-verify CUDA graph per draft width. Tree-mask
+    preparation and post-draft metadata updates must use the backend captured
+    with that graph; otherwise they write one static buffer and replay another.
+    """
+    graph_runners = getattr(
+        target_worker.model_runner, "hybrid_target_verify_graph_runners", None
+    )
+    if graph_runners is not None:
+        graph_runner = graph_runners.get(draft_token_num)
+        if graph_runner is not None:
+            return graph_runner.attn_backend
+    return target_worker.model_runner.attn_backend
+
+
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
