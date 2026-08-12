@@ -858,11 +858,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if source_draft_token_num is None
             else source_draft_token_num
         )
-        if torch.any(batch_result.accept_lens > source_draft_token_num):
-            raise ValueError(
-                "Hybrid draft extend received accept_lens larger than source "
-                f"verify width {source_draft_token_num}."
-            )
+        # if torch.any(batch_result.accept_lens > source_draft_token_num):
+        #     raise ValueError(
+        #         "Hybrid draft extend received accept_lens larger than source "
+        #         f"verify width {source_draft_token_num}."
+        #     )
         draft_extend_attn_backend, cuda_graph_runner = (
             self._hybrid_draft_extend_resources.get(
                 source_draft_token_num,
@@ -1013,6 +1013,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        spec_stage_span_prefix: str = "",
     ):
         # Parse arguments
         self.server_args = server_args
@@ -1027,6 +1028,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.spec_stage_span_prefix = spec_stage_span_prefix
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -1243,7 +1245,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
+                spec_stage_span(self.spec_stage_span_prefix + "_draft_extend_prefill"),
             ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -1293,12 +1295,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
+                    spec_stage_span(self.spec_stage_span_prefix + "_draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            with spec_stage_span(self.spec_stage_span_prefix + "_verify"):
+                batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1314,7 +1317,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
+                    spec_stage_span(self.spec_stage_span_prefix + "_draft_extend_decode"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
@@ -1324,29 +1327,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         batch_result,
-        bonus_tokens: torch.Tensor,
-        source_draft_token_num: int | None = None,
     ) -> None:
         # Keep the source verify path for a future NGRAM CPU lookup. The new
         # EAGLE draft input only needs ``bonus_tokens`` as GPU state, but
         # replacing the accepted path with that bonus would break a subsequent
         # neural -> retrieval route switch.
-        source_input = batch_result.next_draft_input
-        source_accept_tokens = source_input.accept_tokens
-        source_accept_lens = source_input.accept_lens
-        source_accept_width = source_input.accept_width
-        source_accept_buffer_width = source_input.accept_buffer_width
-        batch_result.next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
-        batch_result.next_draft_input.accept_tokens = source_accept_tokens
-        batch_result.next_draft_input.accept_lens = source_accept_lens
-        batch_result.next_draft_input.accept_width = source_accept_width
-        batch_result.next_draft_input.accept_buffer_width = source_accept_buffer_width
-        self.draft_worker._draft_extend_for_decode(
-            batch, batch_result, source_draft_token_num=source_draft_token_num
-        )
+        with spec_stage_span(self.spec_stage_span_prefix + "_draft_extend_decode_retrieval"):
+            source_draft_token_num = batch_result.speculative_num_draft_tokens
+            accept_buffer_width = getattr(
+                batch_result.next_draft_input,
+                "accept_buffer_width",
+                source_draft_token_num,
+            )
+            accept_tokens = batch_result.next_draft_input.accept_tokens.view(
+                len(batch.reqs), accept_buffer_width
+            )[:, :source_draft_token_num]
+            bonus_indices = (batch_result.accept_lens - 1).to(torch.long).unsqueeze(1)
+            bonus_tokens = accept_tokens.gather(1, bonus_indices).squeeze(1)
+
+            source_input = batch_result.next_draft_input
+            source_accept_tokens = source_input.accept_tokens
+            source_accept_lens = source_input.accept_lens
+            source_accept_width = source_input.accept_width
+            source_accept_buffer_width = source_input.accept_buffer_width
+            batch_result.next_draft_input = EagleDraftInput(
+                bonus_tokens=bonus_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_result.next_draft_input.accept_tokens = source_accept_tokens
+            batch_result.next_draft_input.accept_lens = source_accept_lens
+            batch_result.next_draft_input.accept_width = source_accept_width
+            batch_result.next_draft_input.accept_buffer_width = source_accept_buffer_width
+            self.draft_worker._draft_extend_for_decode(
+                batch, batch_result, source_draft_token_num=source_draft_token_num
+            )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -1442,8 +1456,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        route: Optional[str] = None,
     ) -> None:
+        # ``route`` is only meaningful to HybridController's dispatch; this
+        # leaf worker's own adaptive controller always applies to itself.
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size

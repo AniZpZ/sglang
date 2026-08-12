@@ -315,12 +315,18 @@ class BaseSpecWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        route: str | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        ``route`` is the producer route stamped by HybridController
+        (``GenerationBatchResult.spec_route``); leaf workers ignore it since
+        only the controller needs it to dispatch to the right sub-worker.
         """
         pass
 
@@ -332,12 +338,16 @@ class BaseSpecWorker(ABC):
         """
         pass
 
-    def get_retrieval_continuation_lengths(self, batch) -> list[int]:
+    def get_retrieval_info(self, batch) -> tuple[list[int], list[int]]:
         """Prepare retrieval drafts and return real per-request suffix continuations.
 
         The worker owns the algorithm-specific corpus lookup. If the controller
         selects retrieval for this batch, its subsequent forward must reuse the
-        prepared drafts rather than repeat the lookup.
+        prepared drafts rather than repeat the lookup. Returns a
+        ``(continuation_lengths, match_lens)`` pair: ``continuation_lengths`` is
+        the per-request non-padding draft length, and ``match_lens`` is the
+        per-request longest expandable corpus suffix-match depth backing that
+        draft.
         """
         raise NotImplementedError
 

@@ -46,6 +46,13 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # The route ("retrieval" / "neural") that actually produced this result.
+    # Only set by HybridController; every other worker leaves this None. The
+    # result travels with its own producer identity so a delayed, CPU-side
+    # consumer (e.g. HybridController.on_verify_complete_cpu under overlap)
+    # never misattributes it to whichever route is currently active.
+    spec_route: Optional[str] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None

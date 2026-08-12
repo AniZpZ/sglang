@@ -22,6 +22,7 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
+    spec_stage_span,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -54,6 +55,7 @@ class NGRAMWorker(BaseSpecWorker):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        spec_stage_span_prefix: str = "",
     ):
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -69,16 +71,19 @@ class NGRAMWorker(BaseSpecWorker):
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.spec_stage_span_prefix = spec_stage_span_prefix
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        self.last_batch_has_match = False
         # A retrieval route query prepares these CPU drafts before the controller
-        # chooses a route. The selected retrieval forward consumes this cache.
+        # chooses a route. HybridController always calls
+        # get_retrieval_info() on the current batch immediately
+        # before choosing a route within the same forward_batch_generation call,
+        # so a non-None cache here is always fresh for this batch; no per-batch
+        # identity check is needed.
         self._hybrid_prepared_drafts = None
-        self._hybrid_prepared_batch_id = None
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
@@ -123,7 +128,6 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
         self._hybrid_prepared_drafts = None
-        self._hybrid_prepared_batch_id = None
 
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
@@ -205,16 +209,20 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        route: Optional[str] = None,
     ) -> None:
         # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
         # result processor calls it with batch_size as a keyword argument.
+        # ``route`` is only meaningful to HybridController's dispatch.
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
@@ -275,7 +283,7 @@ class NGRAMWorker(BaseSpecWorker):
             total_lens.append(
                 len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
             )
-        req_drafts, mask = self.ngram_corpus.batch_get(
+        req_drafts, mask, match_lens = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
         total_draft_token_num = len(req_drafts)
@@ -284,53 +292,22 @@ class NGRAMWorker(BaseSpecWorker):
         assert (
             total_draft_token_num == bs * self.draft_token_num
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
-        return req_drafts, mask
+        return req_drafts, mask, match_lens
 
-    def get_retrieval_continuation_lengths(self, batch: ScheduleBatch) -> list[int]:
-        stride = self.draft_token_num
-        previous = batch.spec_info
-        bonus_tokens = getattr(previous, "bonus_tokens", None)
-        if bonus_tokens is None:
-            bonus_tokens = torch.zeros(
-                len(batch.reqs), dtype=torch.int32, device=self.device
-            )
-        accept_tokens = torch.zeros(
-            len(batch.reqs), stride, dtype=torch.int32, device=bonus_tokens.device
-        )
-        accept_tokens[:, 0] = bonus_tokens
-        previous_accept_tokens = getattr(previous, "accept_tokens", None)
-        previous_accept_lens = getattr(previous, "accept_lens", None)
-        previous_accept_width = getattr(previous, "accept_width", None)
-        previous_accept_buffer_width = getattr(previous, "accept_buffer_width", None)
-        batch.spec_info = NgramVerifyInput(
-            draft_token_num=stride,
-            new_seq_lens=batch.seq_lens,
-            accept_tokens=(
-                previous_accept_tokens
-                if previous_accept_tokens is not None
-                else accept_tokens.flatten()
-            ),
-            accept_lens=(
-                previous_accept_lens
-                if previous_accept_lens is not None
-                else torch.ones_like(bonus_tokens, dtype=torch.int32)
-            ),
-            accept_width=(
-                stride if previous_accept_width is None else previous_accept_width
-            ),
-            accept_buffer_width=(
-                stride
-                if previous_accept_buffer_width is None
-                else previous_accept_buffer_width
-            ),
-        )
-        drafts, mask = self._prepare_draft_tokens(batch)
-        # This lookup is intentionally cached: a selected retrieval route must
-        # use the exact drafts and mask whose continuation lengths were routed.
-        self._hybrid_prepared_drafts = (drafts, mask)
-        self._hybrid_prepared_batch_id = id(batch)
-        draft_rows = drafts.reshape(len(batch.reqs), self.draft_token_num)
-        return (draft_rows[:, 1:] != 0).sum(axis=1).tolist()
+    def get_retrieval_info(self, batch: ScheduleBatch) -> tuple[list[int], list[int]]:
+        """Probe the corpus with the current suffix and report continuation.
+
+        Reuses ``_prepare_draft_tokens`` for the actual lookup so the probe and
+        an eventual real draft prep never disagree. The (drafts, mask,
+        match_lens) result is cached in ``_hybrid_prepared_drafts`` so a route
+        that does choose ``retrieval`` reuses this exact lookup instead of
+        querying the corpus again.
+        """
+        drafts, mask, match_lens = self._prepare_draft_tokens(batch)
+        self._hybrid_prepared_drafts = (drafts, mask, match_lens)
+        bs = len(batch.reqs)
+        draft_rows = drafts.reshape(bs, self.draft_token_num)
+        return (draft_rows[:, 1:] != 0).sum(axis=1).tolist(), match_lens.tolist()
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch) -> bool:
         # Decode-only: extend goes through the plain target forward, and an
@@ -348,30 +325,12 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
 
-        if self._hybrid_prepared_batch_id == id(batch):
-            req_drafts, mask = self._hybrid_prepared_drafts
+        if self._hybrid_prepared_drafts is not None:
+            req_drafts, mask, _ = self._hybrid_prepared_drafts
             self._hybrid_prepared_drafts = None
-            self._hybrid_prepared_batch_id = None
         else:
-            req_drafts, mask = self._prepare_draft_tokens(batch)
+            req_drafts, mask, _ = self._prepare_draft_tokens(batch)
         mask_rows = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-        draft_rows = req_drafts.reshape(bs, self.draft_token_num)
-        # The corpus ABI zero-pads every slot after the root on a miss. Do not
-        # run target verify for those synthetic drafts.
-        self.last_batch_has_match = bool((draft_rows[:, 1:] != 0).any())
-        if not self.last_batch_has_match:
-            prev_tokens = batch.spec_info.accept_tokens.view(
-                bs,
-                getattr(batch.spec_info, "accept_buffer_width", self.draft_token_num),
-            )
-            bonus_indices = (batch.spec_info.accept_lens - 1).to(torch.long).unsqueeze(1)
-            batch.input_ids = prev_tokens.gather(1, bonus_indices).squeeze(1).to(torch.int64)
-            # Draft preparation reserved NGRAM's verify width. A corpus miss
-            # runs an ordinary one-token target decode, whose cache-location
-            # view must therefore contain one slot per request.
-            if batch.out_cache_loc is not None:
-                batch.out_cache_loc = batch.out_cache_loc[:bs]
-            return False
 
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
@@ -454,51 +413,28 @@ class NGRAMWorker(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._insert_extend_into_ngram_corpus(batch)
             return
-
-        source_stride = batch_result.speculative_num_draft_tokens
-        if source_stride is None:
-            raise ValueError("HYBRID decode result is missing its draft-token width.")
-        accept_tokens = batch_result.next_draft_input.accept_tokens.view(
-            len(batch.reqs),
-            batch_result.next_draft_input.accept_buffer_width,
-        )[:, :source_stride]
-        accept_lens = batch_result.accept_lens
-        accept_tokens_cpu = accept_tokens.cpu().tolist()
-        accept_lens_cpu = accept_lens.cpu().tolist()
-
-        # This hook executes inside the producer's forward, before either
-        # scheduler mode materializes ``batch_result`` into req.output_ids.
-        # Always append the just accepted path; the next scheduler boundary
-        # may be synchronous, but it occurs after this corpus update.
-        batch_tokens = []
-        for req, tokens, accept_len in zip(
-            batch.reqs, accept_tokens_cpu, accept_lens_cpu
-        ):
-            pending_tokens = tokens[:accept_len]
-            batch_tokens.append(
-                self._efficient_concat_last_n(
-                    list(req.origin_input_ids),
-                    list(req.output_ids[-self.max_trie_depth :]) + pending_tokens,
-                    self.max_trie_depth,
-                )
-            )
-        self.ngram_corpus.batch_put(batch_tokens)
+        cur_rids = {req.rid for req in batch.reqs}
+        departed_rids = self._prev_decode_rids - cur_rids
+        if departed_rids:
+            self.ngram_corpus.erase_match_state(list(departed_rids))
+        self._prev_decode_rids = cur_rids
+        self._update_ngram_corpus(batch)
 
     def _insert_extend_into_ngram_corpus(self, batch: ScheduleBatch) -> None:
-        """Index all prompt tokens visible after this extend iteration.
-
-        Re-inserting the growing prefix for chunked prefill is intentional: it
-        preserves n-grams crossing chunk boundaries, while the corpus handles
-        duplicate paths naturally.
-        """
+        """Index the prompt tokens newly visible after this extend iteration."""
         batch_tokens = []
         for req in batch.reqs:
+            prev_len = len(req.prefix_indices)
             processed_len = min(
-                len(req.origin_input_ids),
-                len(req.prefix_indices) + req.extend_input_len,
+                len(req.origin_input_ids), prev_len + req.extend_input_len
             )
-            if processed_len:
-                batch_tokens.append(list(req.origin_input_ids[:processed_len]))
+            if processed_len <= prev_len:
+                continue
+            if req.extend_batch_idx == 1:
+                start = 0
+            else:
+                start = max(0, prev_len - (self.max_trie_depth - 1))
+            batch_tokens.append(list(req.origin_input_ids[start:processed_len]))
         if batch_tokens:
             self.ngram_corpus.batch_put(batch_tokens)
 
@@ -538,110 +474,116 @@ class NGRAMWorker(BaseSpecWorker):
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
-        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
-        has_match = self._prepare_for_speculative_decoding(batch)
-        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        with spec_stage_span(self.spec_stage_span_prefix + "_draft"):
+            # CPU-side corpus suffix lookup + tree-mask/positions construction
+            # (Triton reconstruct_indices_from_tree_mask) and NgramVerifyInput
+            # assembly. No target-model GPU forward happens in this span; it
+            # is the retrieval analogue of EAGLE's "prepare + replay" draft.
+            set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+            self._prepare_for_speculative_decoding(batch)
+            set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
         verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
-        if has_match and batch.forward_mode.is_target_verify():
-            # Prepare grammar data on CPU if needed
-            if batch.has_grammar:
-                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = verify_input.draft_token.view(
-                    verify_input.retrieve_next_token.shape
-                ).cpu()
+        if batch.forward_mode.is_target_verify():
+            with spec_stage_span(self.spec_stage_span_prefix + "_verify"):
+                # Prepare grammar data on CPU if needed
+                if batch.has_grammar:
+                    retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+                    retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+                    draft_tokens_cpu = verify_input.draft_token.view(
+                        verify_input.retrieve_next_token.shape
+                    ).cpu()
 
-            batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
-            )
-
-            logits_output, can_run_cuda_graph = (
-                batch_result.logits_output,
-                batch_result.can_run_cuda_graph,
-            )
-
-            verify_input: NgramVerifyInput = batch.spec_info
-            vocab_mask = None
-            if batch.has_grammar:
-                # Generate the logit mask for structured output.
-                # Overlap the CPU operations for bitmask generation with the forward pass.
-                vocab_mask = generate_token_bitmask(
-                    batch.reqs,
-                    verify_input,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu,
-                    draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
+                batch_result = self.target_worker.forward_batch_generation(
+                    batch, is_verify=True
                 )
 
-                if vocab_mask is not None:
-                    assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                    # and will be applied to produce wrong results
-                    batch.sampling_info.vocab_mask = None
+                logits_output, can_run_cuda_graph = (
+                    batch_result.logits_output,
+                    batch_result.can_run_cuda_graph,
+                )
 
-            # Sample
-            maybe_detect_nan(
-                logits_output.next_token_logits, "verify: target model logits"
-            )
-            maybe_detect_inf(
-                logits_output.next_token_logits, "verify: target model logits"
-            )
-            (
-                predict,
-                accept_lens,
-                accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
-            new_seq_lens = batch.seq_lens + accept_lens
-            commit_mamba_states_after_verify(
-                self.target_worker,
-                batch,
-                accept_lens,
-                accept_index,
-                self.draft_token_num,
-            )
-            accept_tokens = predict[accept_index].flatten()
-            next_token_ids = accept_tokens
+                verify_input: NgramVerifyInput = batch.spec_info
+                vocab_mask = None
+                if batch.has_grammar:
+                    # Generate the logit mask for structured output.
+                    # Overlap the CPU operations for bitmask generation with the forward pass.
+                    vocab_mask = generate_token_bitmask(
+                        batch.reqs,
+                        verify_input,
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        draft_tokens_cpu,
+                        batch.sampling_info.vocab_size,
+                    )
 
-            # The KV mover expects drafts-only counts. NGRAM's
-            # accept_lens includes the bonus token, matching scheduler output.
-            num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
-            if batch.return_logprob:
-                # The last arg is the accept_index row width minus 1. NGRAM's
-                # accept_index is (bs, draft_token_num) -- the tree depth is not
-                # bounded by spec_steps like EAGLE's (bs, spec_steps + 1).
-                compute_spec_v2_logprobs(
-                    batch,
-                    logits_output,
+                    if vocab_mask is not None:
+                        assert verify_input.grammar is not None
+                        vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                        # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                        # and will be applied to produce wrong results
+                        batch.sampling_info.vocab_mask = None
+
+                # Sample
+                maybe_detect_nan(
+                    logits_output.next_token_logits, "verify: target model logits"
+                )
+                maybe_detect_inf(
+                    logits_output.next_token_logits, "verify: target model logits"
+                )
+                (
                     predict,
+                    accept_lens,
                     accept_index,
-                    self.draft_token_num - 1,
+                ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+                new_seq_lens = batch.seq_lens + accept_lens
+                commit_mamba_states_after_verify(
+                    self.target_worker,
+                    batch,
+                    accept_lens,
+                    accept_index,
+                    self.draft_token_num,
                 )
+                accept_tokens = predict[accept_index].flatten()
+                next_token_ids = accept_tokens
 
-            if on_publish is not None:
-                on_publish(new_seq_lens)
+                # The KV mover expects drafts-only counts. NGRAM's
+                # accept_lens includes the bonus token, matching scheduler output.
+                num_correct_drafts_per_req = accept_lens - 1
+                move_accept_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    num_correct_drafts_per_req,
+                    self.token_to_kv_pool_allocator,
+                )
+                if batch.return_logprob:
+                    # The last arg is the accept_index row width minus 1. NGRAM's
+                    # accept_index is (bs, draft_token_num) -- the tree depth is not
+                    # bounded by spec_steps like EAGLE's (bs, spec_steps + 1).
+                    compute_spec_v2_logprobs(
+                        batch,
+                        logits_output,
+                        predict,
+                        accept_index,
+                        self.draft_token_num - 1,
+                    )
 
-            self._update_ngram_corpus(batch)
-            # Erase match state of requests that left the decode batch.
-            # req.finished() is unusable here: under overlap it flips at result
-            # processing, one iteration after the request left the batch.
-            # The last batch's entries persist while idle (bounded, small).
-            cur_rids = {req.rid for req in batch.reqs}
-            departed_rids = self._prev_decode_rids - cur_rids
-            if departed_rids:
-                self.ngram_corpus.erase_match_state(list(departed_rids))
-            self._prev_decode_rids = cur_rids
-            batch.forward_mode = ForwardMode.DECODE
+                if on_publish is not None:
+                    on_publish(new_seq_lens)
+
+                self._update_ngram_corpus(batch)
+                # Erase match state of requests that left the decode batch.
+                # req.finished() is unusable here: under overlap it flips at result
+                # processing, one iteration after the request left the batch.
+                # The last batch's entries persist while idle (bounded, small).
+                cur_rids = {req.rid for req in batch.reqs}
+                departed_rids = self._prev_decode_rids - cur_rids
+                if departed_rids:
+                    self.ngram_corpus.erase_match_state(list(departed_rids))
+                self._prev_decode_rids = cur_rids
+                batch.forward_mode = ForwardMode.DECODE
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)

@@ -46,8 +46,9 @@ class HybridRuntimeState:
 class HybridRouteStats:
     """Per-route scheduling and acceptance metrics, reset on flush_cache."""
 
-    # Per-route batch-level counters. Each forward contributes one batch mean,
-    # so a dynamic batch size does not dominate the routing comparison.
+    # Per-route request-level counters. Keep their definition aligned with
+    # MetricsReporter.update_spec_metrics(), which backs bench_serving's
+    # avg_spec_accept_length: each verified request contributes one forward.
     retrieval_forward_ct: int = 0
     retrieval_num_accept_tokens: float = 0.0
     retrieval_num_draft_tokens: int = 0
@@ -55,9 +56,15 @@ class HybridRouteStats:
     neural_num_accept_tokens: float = 0.0
     neural_num_draft_tokens: int = 0
 
-    # Retrieval routing-decision helpers, accumulated over pure decode batches.
+    # Retrieval routing-decision helpers, accumulated over pure decode requests.
     total_continuation_length: float = 0.0
     matching_req_ct: int = 0
+
+    # Batch-level counter: incremented once per pure-decode forward_batch_generation
+    # call regardless of batch size, so the debug-log interval
+    # (SGLANG_LOG_HYBRID_SPEC) fires every N *batches* as documented, not every
+    # N accumulated requests (which would drift with dynamic batch size).
+    pure_decode_batch_ct: int = 0
 
     def reset(self) -> None:
         for f in self.__dataclass_fields__:
@@ -152,10 +159,10 @@ class HybridController(BaseSpecWorker):
         self.retrieval_worker = self.workers["retrieval"]
         self.neural_worker = self.workers["neural"]
         if getattr(
-            type(self.retrieval_worker), "get_retrieval_continuation_lengths"
-        ) is getattr(BaseSpecWorker, "get_retrieval_continuation_lengths"):
+            type(self.retrieval_worker), "get_retrieval_info"
+        ) is getattr(BaseSpecWorker, "get_retrieval_info"):
             raise ValueError(
-                "HYBRID retrieval worker must override get_retrieval_continuation_lengths."
+                "HYBRID retrieval worker must override get_retrieval_info."
             )
         if getattr(
             type(self.neural_worker), "update_runtime_state_from_hybrid"
@@ -167,14 +174,6 @@ class HybridController(BaseSpecWorker):
             BaseSpecWorker, "update_runtime_state_from_hybrid"
         ):
             raise ValueError("HYBRID retrieval worker must override update_runtime_state_from_hybrid.")
-        self.speculative_num_steps = self.neural_worker.speculative_num_steps
-        self._accept_width = max(
-            self.retrieval_worker.speculative_num_draft_tokens,
-            self.neural_worker.speculative_num_draft_tokens,
-        )
-        # Scheduler-facing allocation uses the largest route width. Each
-        # producer keeps its own accepted-path row width on VerifyInput.
-        self.speculative_num_draft_tokens = self._accept_width
         self._hybrid_draft_extend_widths = tuple(
             sorted(
                 {
@@ -193,6 +192,7 @@ class HybridController(BaseSpecWorker):
         self._route_stats = HybridRouteStats()
         self._runtime_states: dict[str, HybridRuntimeState] = {}
         self._active_runtime_state: HybridRuntimeState | None = None
+        self.log_interval = envs.SGLANG_LOG_HYBRID_SPEC.get()
 
     @staticmethod
     def _load_config(config_json: str) -> dict[str, Any]:
@@ -249,6 +249,7 @@ class HybridController(BaseSpecWorker):
                 moe_dp_rank=worker_args[5],
                 nccl_port=worker_args[6],
                 target_worker=self._target_worker,
+                spec_stage_span_prefix=role,
             )
         return workers
 
@@ -352,11 +353,22 @@ class HybridController(BaseSpecWorker):
             worker.clear_cache_pool()
         self._route_stats.reset()
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req, batch_size=0):
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req, batch_size=0, route: str | None = None
+    ):
         # Verification statistics belong to the route that produced them. In
         # particular, feeding NGRAM acceptance into neural adaptive tuning
         # would corrupt its step selection after a route switch.
-        self.workers[self._last_route].on_verify_complete_cpu(
+        #
+        # Under overlap scheduling this hook runs as a delayed CPU callback
+        # (see batch_result_processor._resolve_spec_v2_tokens), one iteration
+        # after the forward that produced ``num_correct_drafts_per_req``. A
+        # later batch may already have switched ``self._last_route`` by then,
+        # so prefer the route stamped on the originating result
+        # (``GenerationBatchResult.spec_route``) and only fall back to
+        # ``self._last_route`` for callers that predate that field.
+        target_route = route if route is not None else self._last_route
+        self.workers[target_route].on_verify_complete_cpu(
             num_correct_drafts_per_req, batch_size=batch_size
         )
 
@@ -367,14 +379,7 @@ class HybridController(BaseSpecWorker):
         # inactive route state stale.
         for worker in self.workers.values():
             worker.activate_step_by_batch(batch_size)
-        # ``speculative_num_steps`` is the controller's scheduler-facing value
-        # for the neural draft phase. Retrieval has no draft-model steps.
-        self.speculative_num_steps = self.neural_worker.speculative_num_steps
-        self._accept_width = max(
-            self.retrieval_worker.speculative_num_draft_tokens,
-            self.neural_worker.speculative_num_draft_tokens,
-        )
-        self.speculative_num_draft_tokens = self._accept_width
+
 
     def _match_continuation_lengths(self, batch: ScheduleBatch) -> list[int]:
         """Measure the current suffix's actual retrieval continuation.
@@ -382,70 +387,59 @@ class HybridController(BaseSpecWorker):
         The retrieval worker performs the same lookup it will use for drafting;
         the controller only consumes its per-request continuation lengths.
         """
-        return self.retrieval_worker.get_retrieval_continuation_lengths(batch)
+        return self.retrieval_worker.get_retrieval_info(batch)
 
     def _should_use_retrieval(
-        self, batch: ScheduleBatch, lengths: list[int]
+        self, batch: ScheduleBatch, lengths: tuple[list[int], list[int]]
     ) -> bool:
         if not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
             return False
-        # Root occupies one verify slot. Convert each ratio at the current
-        # retrieval width / batch size so routing stays stable as batches vary.
-        min_continuation = math.ceil(
-            (self.retrieval_worker.speculative_num_draft_tokens - 1)
-            * self.routing["min_continuation_ratio"]
+        # Weight each request's continuation by its match_len so a long but
+        # shallow (low-confidence) match cannot outweigh a shorter, deeper one.
+        min_continuation = (
+            self.retrieval_worker.speculative_num_draft_tokens - 1
+        ) * self.routing["min_continuation_ratio"]
+        cont_lens, match_lens = lengths
+        qualifying = sum(
+            cont_len * match_len / self.retrieval_worker.speculative_num_draft_tokens
+            >= min_continuation
+            for cont_len, match_len in zip(cont_lens, match_lens)
         )
-        qualifying = sum(length >= min_continuation for length in lengths)
-        min_matching = math.ceil(
-            len(lengths) * self.routing["min_matching_ratio"]
-        )
+        min_matching = math.ceil(len(cont_lens) * self.routing["min_matching_ratio"])
         return qualifying >= min_matching
 
-    def _update_neural_runtime_state(self, batch: ScheduleBatch, result) -> None:
-        source_draft_token_num = result.speculative_num_draft_tokens
-        accept_buffer_width = getattr(
-            result.next_draft_input,
-            "accept_buffer_width",
-            source_draft_token_num,
-        )
-        accept_tokens = result.next_draft_input.accept_tokens.view(
-            len(batch.reqs), accept_buffer_width
-        )[:, :source_draft_token_num]
-        bonus_indices = (result.accept_lens - 1).to(torch.long).unsqueeze(1)
-        bonus_tokens = accept_tokens.gather(1, bonus_indices).squeeze(1)
-        self.neural_worker.update_runtime_state_from_hybrid(
-            batch,
-            result,
-            bonus_tokens,
-            source_draft_token_num=source_draft_token_num,
-        )
-
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
-        original_spec_info = batch.spec_info
         is_pure_decode = batch.forward_mode.is_decode() and not batch.is_extend_in_batch
         if is_pure_decode:
             lengths = self._match_continuation_lengths(batch)
         else:
-            lengths = []
+            lengths = ([], [])
         if self._should_use_retrieval(batch, lengths):
             self._apply_runtime_state("retrieval")
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
             result = self.retrieval_worker.forward_batch_generation(batch, on_publish)
-            self._update_neural_runtime_state(batch, result)
+            self.neural_worker.update_runtime_state_from_hybrid(batch, result)
             last_shared_buffer_reader = self.neural_worker
             route = "retrieval"
         else:
             self._apply_runtime_state("neural")
-            batch.spec_info = original_spec_info
             result = self.neural_worker.forward_batch_generation(batch, on_publish)
             self.retrieval_worker.update_runtime_state_from_hybrid(batch, result)
             last_shared_buffer_reader = self.neural_worker
             route = "neural"
         self._last_shared_buffer_reader = last_shared_buffer_reader
-        self._update_route_stats(route, result, lengths, is_pure_decode)
+
+        if self.log_interval:
+            self._update_route_stats(route, result, lengths, is_pure_decode)
         if route != self._last_route:
             logger.debug("Hybrid speculative route switched to %s", route)
             self._last_route = route
+        # Stamp the producer route on the result itself. Overlap scheduling
+        # processes this result on a delayed CPU callback
+        # (on_verify_complete_cpu); by then ``self._last_route`` may already
+        # reflect a *later* batch's route, so the attribution must travel
+        # with the result rather than be read from live controller state.
+        result.spec_route = route
         return result
 
     def _update_route_stats(
@@ -462,36 +456,39 @@ class HybridController(BaseSpecWorker):
 
         if is_pure_decode:
             if route == "retrieval":
-                stats.retrieval_forward_ct += 1
-                if bs > 0 and accept_lens is not None:
-                    stats.retrieval_num_accept_tokens += float(accept_lens.float().mean().item())
-                    stats.retrieval_num_draft_tokens += (
+                stats.retrieval_forward_ct += bs
+                if accept_lens is not None:
+                    stats.retrieval_num_accept_tokens += float(accept_lens.sum().item())
+                    stats.retrieval_num_draft_tokens += bs * (
                         self.retrieval_worker.speculative_num_draft_tokens - 1
                     )
             else:
-                stats.neural_forward_ct += 1
-                if bs > 0 and accept_lens is not None:
-                    stats.neural_num_accept_tokens += float(accept_lens.float().mean().item())
-                    stats.neural_num_draft_tokens += (
+                stats.neural_forward_ct += bs
+                if accept_lens is not None:
+                    stats.neural_num_accept_tokens += float(accept_lens.sum().item())
+                    stats.neural_num_draft_tokens += bs * (
                         self.neural_worker.speculative_num_draft_tokens - 1
                     )
 
+            cont_lens, match_lens = continuation_lengths
             min_continuation = math.ceil(
                 (self.retrieval_worker.speculative_num_draft_tokens - 1)
                 * self.routing["min_continuation_ratio"]
             )
             stats.total_continuation_length += (
-                sum(continuation_lengths) / len(continuation_lengths)
-                if continuation_lengths
-                else 0.0
+                sum(cont_lens) / len(cont_lens) if cont_lens else 0.0
             )
-            stats.matching_req_ct += sum(l >= min_continuation for l in continuation_lengths)
+            stats.matching_req_ct += sum(
+                cont_len * match_len / self.retrieval_worker.speculative_num_draft_tokens
+                >= min_continuation
+                for cont_len, match_len in zip(cont_lens, match_lens)
+            )
+            stats.pure_decode_batch_ct += 1
 
-        log_interval = envs.SGLANG_LOG_HYBRID_SPEC.get()
         if (
             is_pure_decode
-            and log_interval > 0
-            and stats.total_forward_ct % log_interval == 0
+            and self.log_interval > 0
+            and stats.pure_decode_batch_ct % self.log_interval == 0
         ):
             avg_cont = stats.avg_continuation_length
             min_cont = math.ceil(

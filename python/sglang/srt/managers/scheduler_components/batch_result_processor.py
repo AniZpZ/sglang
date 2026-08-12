@@ -545,8 +545,15 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        # ``result.spec_route`` carries the producer route stamped by
+        # HybridController; under overlap this callback is delayed by one
+        # iteration, so the route must travel with ``result`` rather than be
+        # read from the controller's current (possibly already-switched)
+        # state. Non-Hybrid workers leave ``spec_route`` as None.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            route=result.spec_route,
         )
 
         predict_tokens = []
